@@ -1,0 +1,20 @@
+{
+  "name": "flower-hotel-reports",
+  "version": "1.0.0",
+  "description": "Flower Hotel Gmail report processor",
+  "main": "gmail-worker.js",
+  "scripts": {
+    "start": "node gmail-worker.js",
+    "local": "node run-from-gmail.js --watch"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "adm-zip": "^0.5.17",
+    "express": "^4.19.2",
+    "googleapis": "^171.4.0",
+    "jszip": "^3.10.1",
+    "xlsx": "^0.18.5"
+  }
+}

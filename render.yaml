@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: flower-hotel-gmail-worker
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: GOOGLE_CREDENTIALS
+        sync: false
+      - key: GOOGLE_TOKEN
+        sync: false
+      - key: CHECK_INTERVAL_MIN
+        value: "5"
+    autoDeploy: true
