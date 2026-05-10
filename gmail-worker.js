@@ -31,6 +31,8 @@ const XLSX_FILE_ID      = '1abLRrgklWeV3wx-KEmA0u4SgCH5ebw3s';
 const TOTAL_ROOMS       = 110;
 const CHECK_INTERVAL_MS = (parseInt(process.env.CHECK_INTERVAL_MIN) || 5) * 60 * 1000;
 const PORT              = parseInt(process.env.PORT) || 3000;
+// GAS web app URL (set in Render env vars as GAS_ENDPOINT_URL)
+const GAS_ENDPOINT_URL  = process.env.GAS_ENDPOINT_URL || '';
 
 const SCOPES = [
   'https://www.googleapis.com/auth/drive',
@@ -43,8 +45,17 @@ const EXCLUDE_NAMES = [
   'jasht pune', 'jashte pune'
 ];
 
-// Room/table patterns that map to House Use in F&B
-const HOUSE_USE_PATTERNS = ['vila 1', 'vila2', 'vila 2', 'dhoma 313', 'fature qerasje'];
+// Room names that count as House Use in F&B (matched against col[7] "Skonto Për")
+// Dhoma VILA 1 - 13, Dhoma VILA2 - 14, Dhoma 313 - 64, Fature Qerasje
+function isHouseUse(tableStr) {
+  const s = String(tableStr).toLowerCase().replace(/\s+/g, ' ').trim();
+  return (
+    /dhoma\s*vila\s*1/.test(s) ||
+    /dhoma\s*vila\s*2/.test(s) ||
+    /dhoma\s*313/.test(s)      ||
+    /fatur[eë]\s*qerasje/.test(s)
+  );
+}
 
 // ── STATUS TRACKING (for /health endpoint) ────────────────────────────────────
 let lastCheckTime    = null;
@@ -217,9 +228,27 @@ function parseNum(v) {
   return isNaN(n) ? 0 : n;
 }
 
-function isHouseUse(tableStr) {
-  const s = String(tableStr).toLowerCase().trim();
-  return HOUSE_USE_PATTERNS.some(p => s.includes(p));
+// Convert Excel date serial (col[3]) to ISO date string "YYYY-MM-DD"
+function excelSerialToISO(serial) {
+  const s = parseFloat(String(serial).replace(',', '.'));
+  if (!s || isNaN(s)) return null;
+  const ms = (Math.floor(s) - 25569) * 86400000;
+  const d  = new Date(ms);
+  return d.toISOString().slice(0, 10);
+}
+
+// Extract the report date from col[3] of the first valid invoice row
+function extractDateFromBuffer(buffer) {
+  const wb   = XLSX.read(buffer, { type: 'buffer', raw: false });
+  const ws   = wb.Sheets[wb.SheetNames[0]];
+  const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
+  for (let r = 1; r < rows.length; r++) {
+    const col0 = String(rows[r][0]).trim();
+    if (col0 === '' || isNaN(Number(col0))) continue;
+    const iso = excelSerialToISO(rows[r][3]);
+    if (iso) return iso;
+  }
+  return null;
 }
 
 function parseFnBBuffer(buffer, label) {
@@ -228,24 +257,25 @@ function parseFnBBuffer(buffer, label) {
   const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
 
   console.log(`  [${label}] ${rows.length} rows`);
-  let revenue = 0, houseUse = 0;
 
-  for (let r = 1; r < rows.length; r++) {
-    const row  = rows[r];
-    const col0 = String(row[0]).trim();
-    if (col0 === '' || isNaN(Number(col0))) continue;
-
-    const shuma     = parseNum(row[6]);
-    const skonto    = parseNum(row[8]);
-    const tableName = String(row[7] || '').trim();
-    const net       = shuma - skonto;
-
-    if (isHouseUse(tableName)) {
-      houseUse += net;
-    } else {
-      revenue += net;
-    }
+  // Revenue = last non-empty value in col[6] (total row at bottom of file)
+  let revenue = 0;
+  for (let r = rows.length - 1; r >= 1; r--) {
+    const v = parseNum(rows[r][6]);
+    if (v !== 0) { revenue = v; break; }
   }
+
+  // House Use = sum of col[6] (Shuma) for invoice rows where col[7] matches house use names
+  let houseUse = 0;
+  for (let r = 1; r < rows.length; r++) {
+    const col0 = String(rows[r][0]).trim();
+    if (col0 === '' || isNaN(Number(col0))) continue;
+    const tableName = String(rows[r][7] || '').trim();
+    if (!tableName) continue;
+    const shuma = parseNum(rows[r][6]);
+    if (isHouseUse(tableName) && shuma !== 0) houseUse += shuma;
+  }
+
   revenue  = Math.round(revenue  * 100) / 100;
   houseUse = Math.round(houseUse * 100) / 100;
   console.log(`    Revenue: ${revenue}  |  HouseUse: ${houseUse}`);
@@ -443,16 +473,72 @@ async function patchXlsx(drive, isoDate, fnbValues, hotelValues) {
   console.log('  ✓ Uploaded');
 }
 
+// ── GAS / FLOW DASHBOARD CALL ─────────────────────────────────────────────────
+async function callGasEndpoint(isoDate, hotelValues, fnbValues) {
+  if (!GAS_ENDPOINT_URL) {
+    console.log('  [GAS] GAS_ENDPOINT_URL not set — skipping Flow Dashboard update');
+    return;
+  }
+  const https = require('https');
+  const http  = require('http');
+  const lib   = GAS_ENDPOINT_URL.startsWith('https') ? https : http;
+  const url   = require('url');
+
+  async function post(body) {
+    return new Promise((resolve, reject) => {
+      const parsed  = url.parse(GAS_ENDPOINT_URL);
+      const payload = JSON.stringify(body);
+      const opts = {
+        hostname: parsed.hostname,
+        path:     parsed.path,
+        method:   'POST',
+        headers:  { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
+      };
+      const req = lib.request(opts, (res) => {
+        let data = '';
+        res.on('data', c => data += c);
+        res.on('end', () => resolve({ status: res.statusCode, body: data }));
+      });
+      req.on('error', reject);
+      req.write(payload);
+      req.end();
+    });
+  }
+
+  try {
+    const r1 = await post({
+      action:          'hotel_performance',
+      date:            isoDate,
+      nightsOccupied:  hotelValues.nightsOccupied,
+      nightsAvailable: hotelValues.nightsAvailable,
+      revenue:         hotelValues.revenue,
+    });
+    console.log(`  [GAS] hotel_performance → HTTP ${r1.status}`);
+
+    const r2 = await post({
+      action:           'fnb_revenues',
+      date:             isoDate,
+      flowerRestaurant: fnbValues.B,
+      poolBar:          fnbValues.C,
+      brutalGarden:     fnbValues.D,
+      poolBarGarden:    fnbValues.E,
+      beachBar:         fnbValues.F,
+      houseUse:         fnbValues.G,
+    });
+    console.log(`  [GAS] fnb_revenues → HTTP ${r2.status}`);
+  } catch (e) {
+    console.error(`  [GAS] ERROR: ${e.message}`);
+  }
+}
+
 // ── MAIN CHECK CYCLE ──────────────────────────────────────────────────────────
 async function runCheck() {
-  const DATE = new Date().toISOString().slice(0, 10);
   checkCount++;
   lastCheckTime   = new Date().toISOString();
   lastCheckStatus = 'running';
 
   console.log('\n' + '═'.repeat(62));
   console.log(` [check #${checkCount}] ${lastCheckTime}`);
-  console.log(` Date: ${DATE}`);
   console.log('═'.repeat(62));
 
   try {
@@ -469,12 +555,13 @@ async function runCheck() {
     }
     console.log(`  Found ${messageIds.length} email(s)\n`);
 
-    const collected = { restorant: null, pool_bar: null, poolbar_g: null, garden: null, hotel: null };
-    const processedMsgIds = [];
-
+    // Group attachments by email, process each email independently
+    // (each email may be a separate date update)
+    const emailGroups = [];
     for (const msgId of messageIds) {
       console.log(`Processing email ${msgId}...`);
       const attachments = await getAttachments(gmail, msgId);
+      const collected   = { restorant: null, pool_bar: null, poolbar_g: null, garden: null, hotel: null };
       let hasReport = false;
 
       for (const { filename, buffer } of attachments) {
@@ -482,14 +569,12 @@ async function runCheck() {
 
         if (type === 'pool_bar' && collected['pool_bar']) {
           const contentType = classifyPoolBarByContent(buffer);
-          console.log(`    → Second pool_bar file — content says: ${contentType}`);
           type = contentType;
           if (contentType === 'pool_bar') {
             const existingType = classifyPoolBarByContent(collected['pool_bar'].buffer);
             if (existingType === 'poolbar_g') {
               collected['poolbar_g'] = collected['pool_bar'];
               collected['pool_bar']  = { filename, buffer };
-              console.log(`    → Swapped: existing pool_bar is actually poolbar_g`);
               hasReport = true;
               continue;
             }
@@ -498,76 +583,94 @@ async function runCheck() {
 
         if (type && !collected[type]) {
           collected[type] = { filename, buffer };
-          console.log(`    → Classified as: ${type}`);
+          console.log(`    → ${type}: ${filename}`);
           hasReport = true;
-        } else if (type && collected[type]) {
-          console.log(`    → ${type} already collected, skipping duplicate`);
-        } else {
+        } else if (!type) {
           console.log(`    → Could not classify: ${filename}`);
         }
       }
-      if (hasReport) processedMsgIds.push(msgId);
+      if (hasReport) emailGroups.push({ msgId, collected });
     }
 
-    // Parse F&B
-    console.log('\n Parsing F&B...');
-    const fnb = { restorant: { revenue: 0, houseUse: 0 }, pool_bar: { revenue: 0, houseUse: 0 }, poolbar_g: { revenue: 0, houseUse: 0 }, garden: { revenue: 0, houseUse: 0 } };
-    for (const key of Object.keys(fnb)) {
-      if (collected[key]) {
-        try { fnb[key] = parseFnBBuffer(collected[key].buffer, key); }
-        catch (e) { console.error(`  ERROR [${key}]: ${e.message}`); }
-      } else {
-        console.log(`  [${key}] not provided — using 0`);
+    for (const { msgId, collected } of emailGroups) {
+      // Extract date from Excel col[3] — NOT from today's date
+      let isoDate = null;
+      for (const key of ['restorant', 'pool_bar', 'garden', 'poolbar_g']) {
+        if (collected[key]) {
+          isoDate = extractDateFromBuffer(collected[key].buffer);
+          if (isoDate) break;
+        }
       }
-    }
+      if (!isoDate && collected.hotel) {
+        isoDate = extractDateFromBuffer(collected.hotel.buffer);
+      }
+      if (!isoDate) {
+        console.error(`  ERROR: could not extract date from Excel for email ${msgId}`);
+        continue;
+      }
+      console.log(`\n  Data e raportit: ${isoDate}`);
 
-    const totalHouseUse = Object.values(fnb).reduce((s, v) => s + v.houseUse, 0);
-    const houseUseNeg   = -(Math.round(totalHouseUse * 100) / 100);
-    const fnbValues = {
-      B: fnb.restorant.revenue,
-      C: fnb.pool_bar.revenue,
-      D: fnb.garden.revenue,
-      E: fnb.poolbar_g.revenue,
-      F: 0,
-      G: houseUseNeg,
-      H: Math.round((fnb.restorant.revenue + fnb.pool_bar.revenue + fnb.garden.revenue + fnb.poolbar_g.revenue + 0 + houseUseNeg) * 100) / 100,
-    };
+      // Parse F&B
+      console.log('\n Parsing F&B...');
+      const fnb = { restorant: { revenue: 0, houseUse: 0 }, pool_bar: { revenue: 0, houseUse: 0 }, poolbar_g: { revenue: 0, houseUse: 0 }, garden: { revenue: 0, houseUse: 0 } };
+      for (const key of Object.keys(fnb)) {
+        if (collected[key]) {
+          try { fnb[key] = parseFnBBuffer(collected[key].buffer, key); }
+          catch (e) { console.error(`  ERROR [${key}]: ${e.message}`); }
+        } else {
+          console.log(`  [${key}] not provided — using 0`);
+        }
+      }
 
-    console.log(` F&B: R=${fnbValues.B} PB=${fnbValues.C} G=${fnbValues.D} PBG=${fnbValues.E} HU=${fnbValues.G} T=${fnbValues.H}`);
+      const totalHouseUse = Object.values(fnb).reduce((s, v) => s + v.houseUse, 0);
+      const houseUseNeg   = -(Math.round(totalHouseUse * 100) / 100);
+      const fnbValues = {
+        B: fnb.restorant.revenue,
+        C: fnb.pool_bar.revenue,
+        D: fnb.garden.revenue,
+        E: fnb.poolbar_g.revenue,
+        F: 0,
+        G: houseUseNeg,
+        H: Math.round((fnb.restorant.revenue + fnb.pool_bar.revenue + fnb.garden.revenue + fnb.poolbar_g.revenue + houseUseNeg) * 100) / 100,
+      };
+      console.log(` F&B: R=${fnbValues.B} PB=${fnbValues.C} G=${fnbValues.D} PBG=${fnbValues.E} HU=${fnbValues.G} T=${fnbValues.H}`);
 
-    // Parse Hotel
-    console.log('\n Parsing Hotel...');
-    let hotelValues = { occupancyPct: 0, nightsOccupied: 0, nightsAvailable: TOTAL_ROOMS, revenue: 0 };
-    if (collected.hotel) {
-      try { hotelValues = parseHotelBuffer(collected.hotel.buffer); }
-      catch (e) { console.error(`  ERROR [hotel]: ${e.message}`); }
-    } else {
-      console.log('  Hotel file not provided — using 0');
-    }
-    console.log(` Hotel: ${hotelValues.nightsOccupied}/${TOTAL_ROOMS} = ${hotelValues.occupancyPct}%  Rev: ${hotelValues.revenue}`);
+      // Parse Hotel
+      console.log('\n Parsing Hotel...');
+      let hotelValues = { occupancyPct: 0, nightsOccupied: 0, nightsAvailable: TOTAL_ROOMS, revenue: 0 };
+      if (collected.hotel) {
+        try { hotelValues = parseHotelBuffer(collected.hotel.buffer); }
+        catch (e) { console.error(`  ERROR [hotel]: ${e.message}`); }
+      } else {
+        console.log('  Hotel file not provided — using 0');
+      }
+      console.log(` Hotel: ${hotelValues.nightsOccupied}/${TOTAL_ROOMS} = ${hotelValues.occupancyPct}%  Rev: ${hotelValues.revenue}`);
 
-    // Write to XLSX
-    console.log('\n Writing to Google Sheet...');
-    await patchXlsx(drive, DATE, fnbValues, hotelValues);
+      // Write to Sample Power BI (XLSX)
+      console.log('\n Writing to Sample Power BI...');
+      await patchXlsx(drive, isoDate, fnbValues, hotelValues);
 
-    // Mark emails as processed
-    console.log('\nMarking emails as processed...');
-    for (const msgId of processedMsgIds) {
+      // Write to Flow Dashboard (GAS)
+      console.log('\n Writing to Flow Dashboard...');
+      await callGasEndpoint(isoDate, hotelValues, fnbValues);
+
+      // Mark this email as processed
       try {
         await markProcessed(gmail, msgId);
-        console.log(`  ✓ ${msgId}`);
+        console.log(`  ✓ marked ${msgId}`);
       } catch (e) {
         console.log(`  (could not mark ${msgId}: ${e.message})`);
       }
+
+      lastProcessed = new Date().toISOString();
+      totalProcessed++;
+
+      console.log('\n' + '═'.repeat(62));
+      console.log(` ✅ ${isoDate} u shkrua saktë.`);
+      console.log('═'.repeat(62) + '\n');
     }
 
-    lastCheckStatus = `ok — processed ${processedMsgIds.length} email(s)`;
-    lastProcessed   = new Date().toISOString();
-    totalProcessed += processedMsgIds.length;
-
-    console.log('\n' + '═'.repeat(62));
-    console.log(` ✅ Done! ${processedMsgIds.length} email(s) processed.`);
-    console.log('═'.repeat(62) + '\n');
+    lastCheckStatus = `ok — processed ${emailGroups.length} email(s)`;
 
   } catch (e) {
     lastCheckStatus = `error: ${e.message}`;
