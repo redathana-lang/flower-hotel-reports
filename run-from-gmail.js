@@ -112,19 +112,31 @@ async function authorize() {
  * Search Gmail for unread messages that have XLS/XLSX attachments.
  * Returns array of message IDs.
  */
-async function findReportEmails(gmail) {
+async function findReportEmails(gmail, isoDate) {
+  // When isoDate is given, restrict to emails received on that date.
+  // When isoDate is null, search ALL unprocessed report emails (catch-up mode,
+  // matches gmail-worker.js behavior).
+  let dateFilter = '';
+  if (isoDate) {
+    const d      = new Date(isoDate + 'T00:00:00Z');
+    const after  = isoDate.replace(/-/g, '/');
+    const nextD  = new Date(d.getTime() + 86400000);
+    const before = nextD.toISOString().slice(0,10).replace(/-/g, '/');
+    dateFilter   = ` after:${after} before:${before}`;
+  }
+
   // Primary: emails with subject "Raporti Ditor" + XLS attachment, not yet processed
-  const primaryQuery = 'subject:"Raporti Ditor" has:attachment -label:processed-report in:inbox';
+  const primaryQuery = `subject:"Raporti Ditor" has:attachment -label:processed-report in:inbox${dateFilter}`;
   const r1 = await gmail.users.messages.list({ userId: 'me', q: primaryQuery, maxResults: 20 });
   if ((r1.data.messages || []).length > 0) {
-    console.log('  (matched subject: Raporti Ditor)');
+    console.log(`  (matched subject: Raporti Ditor${isoDate ? `, date: ${isoDate}` : ''})`);
     return r1.data.messages.map(m => m.id);
   }
-  // Fallback: any unprocessed email with attachments (for emails sent without the subject)
-  const fallbackQuery = 'has:attachment -label:processed-report in:inbox';
+  // Fallback: any unprocessed email with attachments
+  const fallbackQuery = `has:attachment -label:processed-report in:inbox${dateFilter}`;
   const r2 = await gmail.users.messages.list({ userId: 'me', q: fallbackQuery, maxResults: 20 });
   if ((r2.data.messages || []).length > 0) {
-    console.log('  (fallback: any unprocessed attachment email)');
+    console.log(`  (fallback: any unprocessed attachment email${isoDate ? `, date: ${isoDate}` : ''})`);
   }
   return (r2.data.messages || []).map(m => m.id);
 }
@@ -211,6 +223,29 @@ function parseNum(v) {
   return isNaN(n) ? 0 : n;
 }
 
+// Excel date serial → ISO date string (YYYY-MM-DD)
+function excelSerialToISO(serial) {
+  const s = parseFloat(String(serial).replace(',', '.'));
+  if (!s || isNaN(s)) return null;
+  const ms = (Math.floor(s) - 25569) * 86400000;
+  return new Date(ms).toISOString().slice(0, 10);
+}
+
+// Report date lives in col[3] of the first valid invoice row of any Trinosoft sheet.
+// Returns ISO date string, or null if not found.
+function extractDateFromBuffer(buffer) {
+  const wb   = XLSX.read(buffer, { type: 'buffer', raw: false });
+  const ws   = wb.Sheets[wb.SheetNames[0]];
+  const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
+  for (let r = 1; r < rows.length; r++) {
+    const col0 = String(rows[r][0]).trim();
+    if (col0 === '' || isNaN(Number(col0))) continue;
+    const iso = excelSerialToISO(rows[r][3]);
+    if (iso) return iso;
+  }
+  return null;
+}
+
 function isHouseUse(tableStr) {
   const s = String(tableStr).toLowerCase().trim();
   return HOUSE_USE_PATTERNS.some(p => s.includes(p));
@@ -284,6 +319,7 @@ function parseHotelBuffer(buffer) {
 function classifyFile(filename) {
   const n = filename.toLowerCase();
   if (n.includes('prenotim') || n.includes('recepsion') || n.includes('reception') || n.includes('hotel')) return 'hotel';
+  if (n.includes('beach')) return 'beach_bar';
   // "pool bar garden" / "pool bar g" must be checked BEFORE plain "pool bar"
   if (n.includes('pool bar g') || n.includes('pool bar garden') || n.includes('pool_bar_g') || n.includes('poolbar_g') || n.includes('pool_garden') || n.includes('pool garden')) return 'poolbar_g';
   if (n.includes('brutal') || (n.includes('garden') && !n.includes('pool'))) return 'garden';
@@ -477,13 +513,14 @@ async function patchXlsx(drive, isoDate, fnbValues, hotelValues) {
 
 // ── MAIN ──────────────────────────────────────────────────────────────────────
 async function main() {
-  // Date can be passed as first non-flag argument
+  // Date can be passed as first non-flag argument. If omitted, the date is
+  // read from inside each Excel file (col[3] of the first invoice row).
   const dateArg = process.argv.slice(2).find(a => /^\d{4}-\d{2}-\d{2}$/.test(a));
-  const DATE = dateArg || new Date().toISOString().slice(0, 10);
+  let DATE = dateArg || null;
 
   console.log('\n' + '═'.repeat(62));
   console.log(' Flower Hotel — Gmail Report Processor');
-  console.log(` Date: ${DATE}`);
+  console.log(` Date: ${DATE || '(auto — extracted from each Excel file)'}`);
   console.log('═'.repeat(62));
 
   const auth  = await authorize();
@@ -492,7 +529,7 @@ async function main() {
 
   // ── Find unread emails with XLS attachments ───────────────────
   console.log('\nSearching Gmail for unread report emails...');
-  const messageIds = await findReportEmails(gmail);
+  const messageIds = await findReportEmails(gmail, DATE);
   if (messageIds.length === 0) {
     console.log('  No unread emails with XLS attachments found.');
     console.log('  Send the Trinosoft XLS files to flowreport26@gmail.com and run again.\n');
@@ -506,6 +543,7 @@ async function main() {
     pool_bar:  null,
     poolbar_g: null,
     garden:    null,
+    beach_bar: null,
     hotel:     null,
   };
 
@@ -557,6 +595,31 @@ async function main() {
     console.log(`  ${key.padEnd(12)} : ${val ? '✓ ' + val.filename : '✗ missing'}`);
   }
 
+  // ── Resolve report date from file content (when no CLI date given) ──
+  if (!DATE) {
+    const seen = {};
+    for (const key of ['restorant', 'pool_bar', 'garden', 'poolbar_g', 'beach_bar', 'hotel']) {
+      if (!collected[key]) continue;
+      const iso = extractDateFromBuffer(collected[key].buffer);
+      if (iso) seen[key] = iso;
+    }
+    const dates = Object.values(seen);
+    if (dates.length === 0) {
+      console.error('\n  ERROR: could not extract a date from any Excel file.');
+      console.error('  Pass an explicit date:  node run-from-gmail.js YYYY-MM-DD\n');
+      process.exit(1);
+    }
+    const unique = [...new Set(dates)];
+    if (unique.length > 1) {
+      console.error('\n  ERROR: files disagree on report date — refusing to write:');
+      for (const [k, v] of Object.entries(seen)) console.error(`    ${k.padEnd(12)} : ${v}`);
+      console.error('  Pass an explicit date to override:  node run-from-gmail.js YYYY-MM-DD\n');
+      process.exit(1);
+    }
+    DATE = unique[0];
+    console.log(`\n  Report date (from file content): ${DATE}`);
+  }
+
   // ── Parse F&B ─────────────────────────────────────────────────
   console.log('\n' + '─'.repeat(62));
   console.log(' Parsing F&B...');
@@ -565,6 +628,7 @@ async function main() {
     pool_bar:  { revenue: 0, houseUse: 0 },
     poolbar_g: { revenue: 0, houseUse: 0 },
     garden:    { revenue: 0, houseUse: 0 },
+    beach_bar: { revenue: 0, houseUse: 0 },
   };
 
   for (const key of Object.keys(fnb)) {
@@ -587,10 +651,10 @@ async function main() {
     C: fnb.pool_bar.revenue,
     D: fnb.garden.revenue,
     E: fnb.poolbar_g.revenue,
-    F: 0,                       // Beach Bar (no file)
+    F: fnb.beach_bar.revenue,
     G: houseUseNeg,
     H: Math.round((fnb.restorant.revenue + fnb.pool_bar.revenue + fnb.garden.revenue +
-                   fnb.poolbar_g.revenue + 0 + houseUseNeg) * 100) / 100,
+                   fnb.poolbar_g.revenue + fnb.beach_bar.revenue + houseUseNeg) * 100) / 100,
   };
 
   console.log('\n F&B Summary:');

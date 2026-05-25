@@ -316,6 +316,7 @@ function parseHotelBuffer(buffer) {
 function classifyFile(filename) {
   const n = filename.toLowerCase();
   if (n.includes('prenotim') || n.includes('recepsion') || n.includes('reception') || n.includes('hotel')) return 'hotel';
+  if (n.includes('beach')) return 'beach_bar';
   if (n.includes('pool bar g') || n.includes('pool bar garden') || n.includes('pool_bar_g') || n.includes('poolbar_g') || n.includes('pool_garden') || n.includes('pool garden')) return 'poolbar_g';
   if (n.includes('brutal') || (n.includes('garden') && !n.includes('pool'))) return 'garden';
   if (n.includes('pool bar') || n.includes('pool_bar') || n.includes('poolbar') || n.includes('pool')) return 'pool_bar';
@@ -561,7 +562,7 @@ async function runCheck() {
     for (const msgId of messageIds) {
       console.log(`Processing email ${msgId}...`);
       const attachments = await getAttachments(gmail, msgId);
-      const collected   = { restorant: null, pool_bar: null, poolbar_g: null, garden: null, hotel: null };
+      const collected   = { restorant: null, pool_bar: null, poolbar_g: null, garden: null, beach_bar: null, hotel: null };
       let hasReport = false;
 
       for (const { filename, buffer } of attachments) {
@@ -595,7 +596,7 @@ async function runCheck() {
     for (const { msgId, collected } of emailGroups) {
       // Extract date from Excel col[3] — NOT from today's date
       let isoDate = null;
-      for (const key of ['restorant', 'pool_bar', 'garden', 'poolbar_g']) {
+      for (const key of ['restorant', 'pool_bar', 'garden', 'poolbar_g', 'beach_bar']) {
         if (collected[key]) {
           isoDate = extractDateFromBuffer(collected[key].buffer);
           if (isoDate) break;
@@ -612,7 +613,7 @@ async function runCheck() {
 
       // Parse F&B
       console.log('\n Parsing F&B...');
-      const fnb = { restorant: { revenue: 0, houseUse: 0 }, pool_bar: { revenue: 0, houseUse: 0 }, poolbar_g: { revenue: 0, houseUse: 0 }, garden: { revenue: 0, houseUse: 0 } };
+      const fnb = { restorant: { revenue: 0, houseUse: 0 }, pool_bar: { revenue: 0, houseUse: 0 }, poolbar_g: { revenue: 0, houseUse: 0 }, garden: { revenue: 0, houseUse: 0 }, beach_bar: { revenue: 0, houseUse: 0 } };
       for (const key of Object.keys(fnb)) {
         if (collected[key]) {
           try { fnb[key] = parseFnBBuffer(collected[key].buffer, key); }
@@ -629,11 +630,11 @@ async function runCheck() {
         C: fnb.pool_bar.revenue,
         D: fnb.garden.revenue,
         E: fnb.poolbar_g.revenue,
-        F: 0,
+        F: fnb.beach_bar.revenue,
         G: houseUseNeg,
-        H: Math.round((fnb.restorant.revenue + fnb.pool_bar.revenue + fnb.garden.revenue + fnb.poolbar_g.revenue + houseUseNeg) * 100) / 100,
+        H: Math.round((fnb.restorant.revenue + fnb.pool_bar.revenue + fnb.garden.revenue + fnb.poolbar_g.revenue + fnb.beach_bar.revenue + houseUseNeg) * 100) / 100,
       };
-      console.log(` F&B: R=${fnbValues.B} PB=${fnbValues.C} G=${fnbValues.D} PBG=${fnbValues.E} HU=${fnbValues.G} T=${fnbValues.H}`);
+      console.log(` F&B: R=${fnbValues.B} PB=${fnbValues.C} G=${fnbValues.D} PBG=${fnbValues.E} BB=${fnbValues.F} HU=${fnbValues.G} T=${fnbValues.H}`);
 
       // Parse Hotel
       console.log('\n Parsing Hotel...');
