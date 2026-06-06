@@ -50,8 +50,14 @@ const SCOPES = [
 // Names to EXCLUDE from hotel occupancy (owner / out-of-service rooms)
 const EXCLUDE_NAMES = [
   'ernest caci', 'olti caci', 'olti  caci', 'ahmet caci',
-  'jasht pune', 'jashte pune'
+  'jasht pune', 'jashte pune',
+  'bllok'
 ];
+
+// Block/agency CLIENT names also excluded from occupancy for reports dated 2026-06-06
+// onward (matched ONLY against the client name, never the source/Burimi).
+const EXCLUDE_NAMES_NEW = ['itaka', 'saistours', 'w2m'];
+const NEW_EXCL_FROM_DATE = '2026-06-06';
 
 // Room/table patterns that map to House Use in F&B
 const HOUSE_USE_PATTERNS = ['vila 1', 'vila2', 'vila 2', 'dhoma 313', 'fature qerasje'];
@@ -281,10 +287,14 @@ function parseFnBBuffer(buffer, label) {
   return { revenue, houseUse };
 }
 
-function parseHotelBuffer(buffer) {
+function parseHotelBuffer(buffer, isoDate) {
   const wb   = XLSX.read(buffer, { type: 'buffer', raw: false });
   const ws   = wb.Sheets[wb.SheetNames[0]];
   const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
+
+  // From 2026-06-06 onward also exclude block/agency client names (ITAKA, SAISTOURS, W2M).
+  const excludeNames = (isoDate && isoDate >= NEW_EXCL_FROM_DATE)
+    ? EXCLUDE_NAMES.concat(EXCLUDE_NAMES_NEW) : EXCLUDE_NAMES;
 
   console.log(`  [hotel] ${rows.length} rows`);
   let nightsOccupied = 0, totalRevenue = 0;
@@ -299,7 +309,7 @@ function parseHotelBuffer(buffer) {
     const totali  = parseNum(row[11]);
     const nameLo  = klienti.toLowerCase().replace(/\s+/g, ' ');
 
-    if (!EXCLUDE_NAMES.some(ex => nameLo.includes(ex))) {
+    if (!excludeNames.some(ex => nameLo.includes(ex))) {
       nightsOccupied += (dite > 0 ? dite : 1);
       totalRevenue   += totali;
     }
@@ -679,7 +689,7 @@ async function main() {
   let hotelValues = { occupancyPct: 0, nightsOccupied: 0, nightsAvailable: TOTAL_ROOMS, revenue: 0 };
   if (collected.hotel) {
     try {
-      hotelValues = parseHotelBuffer(collected.hotel.buffer);
+      hotelValues = parseHotelBuffer(collected.hotel.buffer, DATE);
     } catch (e) {
       console.error(`  ERROR [hotel]: ${e.message}`);
     }
