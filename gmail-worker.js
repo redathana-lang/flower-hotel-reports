@@ -42,7 +42,8 @@ const SCOPES = [
 // Names to EXCLUDE from hotel occupancy (owner / out-of-service rooms)
 const EXCLUDE_NAMES = [
   'ernest caci', 'olti caci', 'olti  caci', 'ahmet caci',
-  'jasht pune', 'jashte pune'
+  'jasht pune', 'jashte pune',
+  'bllok'
 ];
 
 // Room names that count as House Use in F&B (matched against col[7] "Skonto Për")
@@ -445,14 +446,20 @@ async function patchXlsx(drive, isoDate, fnbValues, hotelValues) {
     console.log(`    Styles from row ${r-1}: A=s${sA} B=s${sB}(t=${sBt},ss=${ssIdx}) C=s${sC} D=s${sD} E=s${sE} F=s${sF}`);
 
     const { occupancyPct, nightsOccupied, nightsAvailable, revenue } = hotelValues;
-    const occDecimal = nightsOccupied / nightsAvailable;
+    // Preserve the per-day available rooms already in col E (maintained from Power BI;
+    // varies during June 2026). Recompute occupancy against it; fall back to the parsed
+    // default only when the cell is empty — never clobber a real availability value.
+    const curHotelRow = hotelXml.match(new RegExp(`<row r="${r}"[^>]*>[\\s\\S]*?<\\/row>`))?.[0] || '';
+    const curAvailM = curHotelRow.match(new RegExp(`<c r="E${r}"[^>]*><v>([\\d.]+)<\\/v>`));
+    const availRooms = (curAvailM && parseFloat(curAvailM[1]) > 0) ? parseFloat(curAvailM[1]) : nightsAvailable;
+    const occDecimal = availRooms > 0 ? nightsOccupied / availRooms : 0;
     const newRow =
       `<row r="${r}" ht="14.25" customHeight="1">` +
       `<c r="A${r}" s="${sA}"><v>${ser}.0</v></c>` +
       `<c r="B${r}" s="${sB}" t="${sBt}"><v>${ssIdx}</v></c>` +
       `<c r="C${r}" s="${sC}"><f t="shared" si="1"/><v>${occDecimal}</v></c>` +
       `<c r="D${r}" s="${sD}"><v>${nightsOccupied}.0</v></c>` +
-      `<c r="E${r}" s="${sE}"><v>${nightsAvailable}.0</v></c>` +
+      `<c r="E${r}" s="${sE}"><v>${availRooms}</v></c>` +
       `<c r="F${r}" s="${sF}"><v>${revenue}</v></c>` +
       `</row>`;
     hotelXml = hotelXml.replace(new RegExp(`<row r="${r}"[^>]*>[\\s\\S]*?<\\/row>`), newRow);
