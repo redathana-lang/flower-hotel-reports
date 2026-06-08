@@ -417,7 +417,11 @@ function readRefStyles(xml, refRowNum, colLetters) {
   return styles;
 }
 
-async function patchXlsx(drive, isoDate, fnbValues, hotelValues) {
+async function patchXlsx(drive, isoDate, fnbValues, hotelValues, opts = {}) {
+  // writeFnb / writeHotel let the caller fill ONLY the sheet(s) that had source
+  // files. A sheet whose flag is false is left exactly as it was — so a hotel-only
+  // catch-up updates Hotel without wiping the F&B row for that date.
+  const { writeFnb = true, writeHotel = true } = opts;
   console.log('\nDownloading XLSX from Google Drive...');
   const res = await drive.files.get(
     { fileId: XLSX_FILE_ID, alt: 'media' },
@@ -430,8 +434,10 @@ async function patchXlsx(drive, isoDate, fnbValues, hotelValues) {
 
   // ── FNB (sheet3.xml) ──────────────────────────────────────────
   let fnbXml = await zip.file('xl/worksheets/sheet3.xml').async('string');
-  const fnbInfo = findRowForDate(fnbXml, isoDate);
-  if (!fnbInfo) {
+  const fnbInfo = writeFnb ? findRowForDate(fnbXml, isoDate) : null;
+  if (!writeFnb) {
+    console.log('  FNB: no F&B file — leaving sheet3 untouched');
+  } else if (!fnbInfo) {
     console.error(`  FNB: date ${isoDate} not found in sheet!`);
   } else {
     const r = fnbInfo.rowNum;
@@ -465,8 +471,10 @@ async function patchXlsx(drive, isoDate, fnbValues, hotelValues) {
 
   // ── Hotel (sheet2.xml) ────────────────────────────────────────
   let hotelXml = await zip.file('xl/worksheets/sheet2.xml').async('string');
-  const hotelInfo = findRowForDate(hotelXml, isoDate);
-  if (!hotelInfo) {
+  const hotelInfo = writeHotel ? findRowForDate(hotelXml, isoDate) : null;
+  if (!writeHotel) {
+    console.log('  Hotel: no Prenotimet/reception file — leaving sheet2 untouched');
+  } else if (!hotelInfo) {
     console.error(`  Hotel: date ${isoDate} not found in sheet!`);
   } else {
     const r   = hotelInfo.rowNum;
@@ -703,9 +711,12 @@ async function main() {
   console.log(`   Revenue          : ${hotelValues.revenue}`);
 
   // ── Write to XLSX ─────────────────────────────────────────────
+  // Only fill the sheet(s) for which files were actually provided.
+  const hasHotel = !!collected.hotel;
+  const hasFnb   = ['restorant','pool_bar','poolbar_g','garden','beach_bar'].some(k => collected[k]);
   console.log('\n' + '─'.repeat(62));
-  console.log(' Writing to Google Sheet...');
-  await patchXlsx(drive, DATE, fnbValues, hotelValues);
+  console.log(` Writing to Google Sheet (${[hasHotel && 'Hotel', hasFnb && 'F&B'].filter(Boolean).join(' + ') || 'nothing'})...`);
+  await patchXlsx(drive, DATE, fnbValues, hotelValues, { writeFnb: hasFnb, writeHotel: hasHotel });
 
   // ── Mark emails as processed ──────────────────────────────────
   console.log('\nMarking emails as processed...');

@@ -386,7 +386,11 @@ function readRefStyles(xml, refRowNum, colLetters) {
   return styles;
 }
 
-async function patchXlsx(drive, isoDate, fnbValues, hotelValues) {
+async function patchXlsx(drive, isoDate, fnbValues, hotelValues, opts = {}) {
+  // writeFnb / writeHotel let the caller fill ONLY the sheet(s) that had source
+  // files in the email. A sheet whose flag is false is left exactly as it was —
+  // so sending just the Prenotimet (reception) file updates Hotel without wiping F&B.
+  const { writeFnb = true, writeHotel = true } = opts;
   console.log('\nDownloading XLSX from Google Drive...');
   const res = await drive.files.get(
     { fileId: XLSX_FILE_ID, alt: 'media' },
@@ -399,8 +403,10 @@ async function patchXlsx(drive, isoDate, fnbValues, hotelValues) {
 
   // ── FNB (sheet3.xml) ──────────────────────────────────────────
   let fnbXml = await zip.file('xl/worksheets/sheet3.xml').async('string');
-  const fnbInfo = findRowForDate(fnbXml, isoDate);
-  if (!fnbInfo) {
+  const fnbInfo = writeFnb ? findRowForDate(fnbXml, isoDate) : null;
+  if (!writeFnb) {
+    console.log('  FNB: no F&B file in this email — leaving sheet3 untouched');
+  } else if (!fnbInfo) {
     console.error(`  FNB: date ${isoDate} not found in sheet!`);
   } else {
     const r   = fnbInfo.rowNum;
@@ -433,8 +439,10 @@ async function patchXlsx(drive, isoDate, fnbValues, hotelValues) {
 
   // ── Hotel (sheet2.xml) ────────────────────────────────────────
   let hotelXml = await zip.file('xl/worksheets/sheet2.xml').async('string');
-  const hotelInfo = findRowForDate(hotelXml, isoDate);
-  if (!hotelInfo) {
+  const hotelInfo = writeHotel ? findRowForDate(hotelXml, isoDate) : null;
+  if (!writeHotel) {
+    console.log('  Hotel: no Prenotimet/reception file in this email — leaving sheet2 untouched');
+  } else if (!hotelInfo) {
     console.error(`  Hotel: date ${isoDate} not found in sheet!`);
   } else {
     const r   = hotelInfo.rowNum;
@@ -491,7 +499,8 @@ async function patchXlsx(drive, isoDate, fnbValues, hotelValues) {
 }
 
 // ── GAS / FLOW DASHBOARD CALL ─────────────────────────────────────────────────
-async function callGasEndpoint(isoDate, hotelValues, fnbValues) {
+async function callGasEndpoint(isoDate, hotelValues, fnbValues, opts = {}) {
+  const { writeFnb = true, writeHotel = true } = opts;
   if (!GAS_ENDPOINT_URL) {
     console.log('  [GAS] GAS_ENDPOINT_URL not set — skipping Flow Dashboard update');
     return;
@@ -523,26 +532,34 @@ async function callGasEndpoint(isoDate, hotelValues, fnbValues) {
   }
 
   try {
-    const r1 = await post({
-      action:          'hotel_performance',
-      date:            isoDate,
-      nightsOccupied:  hotelValues.nightsOccupied,
-      nightsAvailable: hotelValues.nightsAvailable,
-      revenue:         hotelValues.revenue,
-    });
-    console.log(`  [GAS] hotel_performance → HTTP ${r1.status}`);
+    if (writeHotel) {
+      const r1 = await post({
+        action:          'hotel_performance',
+        date:            isoDate,
+        nightsOccupied:  hotelValues.nightsOccupied,
+        nightsAvailable: hotelValues.nightsAvailable,
+        revenue:         hotelValues.revenue,
+      });
+      console.log(`  [GAS] hotel_performance → HTTP ${r1.status}`);
+    } else {
+      console.log('  [GAS] hotel_performance skipped — no hotel file in this email');
+    }
 
-    const r2 = await post({
-      action:           'fnb_revenues',
-      date:             isoDate,
-      flowerRestaurant: fnbValues.B,
-      poolBar:          fnbValues.C,
-      brutalGarden:     fnbValues.D,
-      poolBarGarden:    fnbValues.E,
-      beachBar:         fnbValues.F,
-      houseUse:         fnbValues.G,
-    });
-    console.log(`  [GAS] fnb_revenues → HTTP ${r2.status}`);
+    if (writeFnb) {
+      const r2 = await post({
+        action:           'fnb_revenues',
+        date:             isoDate,
+        flowerRestaurant: fnbValues.B,
+        poolBar:          fnbValues.C,
+        brutalGarden:     fnbValues.D,
+        poolBarGarden:    fnbValues.E,
+        beachBar:         fnbValues.F,
+        houseUse:         fnbValues.G,
+      });
+      console.log(`  [GAS] fnb_revenues → HTTP ${r2.status}`);
+    } else {
+      console.log('  [GAS] fnb_revenues skipped — no F&B file in this email');
+    }
   } catch (e) {
     console.error(`  [GAS] ERROR: ${e.message}`);
   }
@@ -663,13 +680,19 @@ async function runCheck() {
       }
       console.log(` Hotel: ${hotelValues.nightsOccupied}/${TOTAL_ROOMS} = ${hotelValues.occupancyPct}%  Rev: ${hotelValues.revenue}`);
 
+      // Only fill the sheet(s) this email actually carried files for. A hotel-only
+      // email updates Hotel and leaves F&B as-is; an F&B-only email does the reverse.
+      const hasHotel = !!collected.hotel;
+      const hasFnb   = ['restorant','pool_bar','poolbar_g','garden','beach_bar'].some(k => collected[k]);
+      console.log(`\n Sheets to fill: ${[hasHotel && 'Hotel', hasFnb && 'F&B'].filter(Boolean).join(' + ') || '(none)'}`);
+
       // Write to Sample Power BI (XLSX)
       console.log('\n Writing to Sample Power BI...');
-      await patchXlsx(drive, isoDate, fnbValues, hotelValues);
+      await patchXlsx(drive, isoDate, fnbValues, hotelValues, { writeFnb: hasFnb, writeHotel: hasHotel });
 
       // Write to Flow Dashboard (GAS)
       console.log('\n Writing to Flow Dashboard...');
-      await callGasEndpoint(isoDate, hotelValues, fnbValues);
+      await callGasEndpoint(isoDate, hotelValues, fnbValues, { writeFnb: hasFnb, writeHotel: hasHotel });
 
       // Mark this email as processed
       try {
