@@ -756,13 +756,18 @@ async function runCheck() {
       if (hotelFiles.length) {
         console.log(`\n Parsing Hotel (${hotelFiles.length} file(s))...`);
         for (const hf of hotelFiles) {
-          const hDate = parseReportDateFromName(hf.filename, year)
-                     || parseReportDateFromName(subject, year)
-                     || fnbDate;
+          // Date precedence: the filename ("...9 Qeshor.xls") wins. Otherwise, in a
+          // 6-doc bundle, use the F&B invoice date so the hotel row lines up with the
+          // F&B row; finally fall back to the email subject ("Raporti Ditor 9 Qeshor").
+          const fromName    = parseReportDateFromName(hf.filename, year);
+          const fromSubject = parseReportDateFromName(subject, year);
+          const hDate = fromName || fnbDate || fromSubject;
           if (!hDate) {
             console.error(`  ERROR: no date for hotel file "${hf.filename}" — not in filename or subject, and no F&B file to borrow it from. Skipped. Rename the file with the day, e.g. "Prenotimet ne recepsion 9 Qeshor.xls".`);
             continue;
           }
+          const dateSrc = fromName ? 'filename' : (fnbDate ? 'F&B reports' : 'subject');
+          console.log(`  date source for ${hf.filename}: ${dateSrc} → ${hDate}`);
           let hv;
           try { hv = parseHotelBuffer(hf.buffer, hDate); }
           catch (e) { console.error(`  ERROR [hotel ${hf.filename}]: ${e.message}`); continue; }
