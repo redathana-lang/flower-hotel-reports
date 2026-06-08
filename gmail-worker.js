@@ -168,6 +168,15 @@ async function getAttachments(gmail, messageId) {
   const msg = await gmail.users.messages.get({ userId: 'me', id: messageId });
   const attachments = [];
 
+  const headers = Object.fromEntries(
+    (msg.data.payload.headers || []).map(h => [String(h.name).toLowerCase(), h.value])
+  );
+  const subject = headers['subject'] || '';
+  // Year the email was received — used to resolve filenames like "9 Qeshor" (no year).
+  const year = msg.data.internalDate
+    ? new Date(parseInt(msg.data.internalDate)).getUTCFullYear()
+    : new Date().getUTCFullYear();
+
   function findParts(parts) {
     if (!parts) return;
     for (const part of parts) {
@@ -196,7 +205,7 @@ async function getAttachments(gmail, messageId) {
       console.log(`    📎 ${filename} (${(data.length / 1024).toFixed(0)} KB)`);
     }
   }
-  return results;
+  return { files: results, subject, year };
 }
 
 async function markProcessed(gmail, messageId) {
@@ -241,6 +250,40 @@ function excelSerialToISO(serial) {
   const ms = (Math.floor(s) - 25569) * 86400000;
   const d  = new Date(ms);
   return d.toISOString().slice(0, 10);
+}
+
+// Reception/hotel files carry NO report-date cell — col[3] is the reservation's
+// check-in date, not the report day. The actual day lives in the filename or subject
+// (e.g. "Prenotimet ne recepsion 9 Qeshor.xls"). Parse it from there.
+const SQ_MONTHS = {
+  janar: 1, shkurt: 2, mars: 3, prill: 4, maj: 5, qershor: 6, qeshor: 6,
+  korrik: 7, gusht: 8, shtator: 9, tetor: 10, nentor: 11, 'nëntor': 11, dhjetor: 12,
+};
+function parseReportDateFromName(text, fallbackYear) {
+  if (!text) return null;
+  const s = String(text).toLowerCase();
+
+  // Numeric: dd-mm-yyyy / dd.mm.yyyy / dd/mm/yyyy (also 2-digit year)
+  let m = s.match(/(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{2,4})/);
+  if (m) {
+    let d = +m[1], mo = +m[2], y = +m[3];
+    if (y < 100) y += 2000;
+    if (d >= 1 && d <= 31 && mo >= 1 && mo <= 12) {
+      return `${y}-${String(mo).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+    }
+  }
+
+  // Albanian "DD <muaji>" — e.g. "9 qeshor", "recepsion10 qeshor", "8 Gusht"
+  const monthAlt = Object.keys(SQ_MONTHS).join('|');
+  m = s.match(new RegExp(`(\\d{1,2})\\s*(${monthAlt})`, 'i'));
+  if (m) {
+    const d = +m[1], mo = SQ_MONTHS[m[2].toLowerCase()];
+    const y = fallbackYear || new Date().getUTCFullYear();
+    if (d >= 1 && d <= 31 && mo) {
+      return `${y}-${String(mo).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+    }
+  }
+  return null;
 }
 
 // Extract the report date from col[3] of the first valid invoice row
@@ -475,7 +518,7 @@ async function patchXlsx(drive, updates) {
   const list = (updates || []).filter(u => u && (u.writeFnb || u.writeHotel));
   if (list.length === 0) {
     console.log('  Nothing to write — no sheets flagged.');
-    return;
+    return [];
   }
 
   console.log('\nDownloading XLSX from Google Drive...');
@@ -491,20 +534,23 @@ async function patchXlsx(drive, updates) {
   let hotelXml = await zip.file('xl/worksheets/sheet2.xml').async('string');
   let fnbChanged = false, hotelChanged = false;
 
-  for (const u of list) {
+  // Mirror each update with whether its row actually landed (date row found).
+  const results = list.map(u => {
+    let fnbWritten = false, hotelWritten = false;
     if (u.writeFnb) {
       const next = patchFnbRow(fnbXml, u.isoDate, u.fnbValues);
-      if (next) { fnbXml = next; fnbChanged = true; }
+      if (next) { fnbXml = next; fnbChanged = true; fnbWritten = true; }
     }
     if (u.writeHotel) {
       const next = patchHotelRow(hotelXml, u.isoDate, u.hotelValues);
-      if (next) { hotelXml = next; hotelChanged = true; }
+      if (next) { hotelXml = next; hotelChanged = true; hotelWritten = true; }
     }
-  }
+    return { isoDate: u.isoDate, fnbValues: u.fnbValues, hotelValues: u.hotelValues, fnbWritten, hotelWritten };
+  });
 
   if (!fnbChanged && !hotelChanged) {
     console.log('  No rows matched — nothing uploaded.');
-    return;
+    return results;
   }
   if (fnbChanged)   zip.file('xl/worksheets/sheet3.xml', fnbXml);
   if (hotelChanged) zip.file('xl/worksheets/sheet2.xml', hotelXml);
@@ -521,6 +567,7 @@ async function patchXlsx(drive, updates) {
     },
   });
   console.log('  ✓ Uploaded');
+  return results;
 }
 
 // ── GAS / FLOW DASHBOARD CALL ─────────────────────────────────────────────────
@@ -619,12 +666,12 @@ async function runCheck() {
     const emailGroups = [];
     for (const msgId of messageIds) {
       console.log(`Processing email ${msgId}...`);
-      const attachments = await getAttachments(gmail, msgId);
+      const { files, subject, year } = await getAttachments(gmail, msgId);
       const collected   = { restorant: null, pool_bar: null, poolbar_g: null, garden: null, beach_bar: null };
       const hotelFiles  = [];   // keep ALL hotel/reception files — one per day, each its own date row
       let hasReport = false;
 
-      for (const { filename, buffer } of attachments) {
+      for (const { filename, buffer } of files) {
         let type = classifyFile(filename);
 
         // Hotel/reception files: collect every one. A single email may carry several
@@ -658,18 +705,18 @@ async function runCheck() {
           console.log(`    → Could not classify: ${filename}`);
         }
       }
-      if (hasReport) emailGroups.push({ msgId, collected, hotelFiles });
+      if (hasReport) emailGroups.push({ msgId, collected, hotelFiles, subject, year });
     }
 
-    for (const { msgId, collected, hotelFiles } of emailGroups) {
+    for (const { msgId, collected, hotelFiles, subject, year } of emailGroups) {
       // Each email may carry an F&B day (one combined row) and/or several hotel days
       // (one row each). Build a list of per-date updates, then write them all at once.
       const updates = [];
+      let fnbDate = null;   // F&B invoice date — also the fallback date for an undated hotel file
 
       // ── F&B: one combined row for one date ────────────────────────────────
       const hasFnb = ['restorant','pool_bar','poolbar_g','garden','beach_bar'].some(k => collected[k]);
       if (hasFnb) {
-        let fnbDate = null;
         for (const key of ['restorant', 'pool_bar', 'garden', 'poolbar_g', 'beach_bar']) {
           if (collected[key]) { fnbDate = extractDateFromBuffer(collected[key].buffer); if (fnbDate) break; }
         }
@@ -703,24 +750,29 @@ async function runCheck() {
       }
 
       // ── Hotel: one row per file, each at its own date ─────────────────────
+      // The reception file has no report-date cell, so the date comes from the
+      // filename ("...9 Qeshor.xls"), then the email subject, then the F&B date
+      // (the all-6 bundle, where the hotel file is undated). Never col[3].
       if (hotelFiles.length) {
         console.log(`\n Parsing Hotel (${hotelFiles.length} file(s))...`);
         for (const hf of hotelFiles) {
-          const hDate = extractDateFromBuffer(hf.buffer);
+          const hDate = parseReportDateFromName(hf.filename, year)
+                     || parseReportDateFromName(subject, year)
+                     || fnbDate;
           if (!hDate) {
-            console.error(`  ERROR: no date in hotel file ${hf.filename} — skipped`);
+            console.error(`  ERROR: no date for hotel file "${hf.filename}" — not in filename or subject, and no F&B file to borrow it from. Skipped. Rename the file with the day, e.g. "Prenotimet ne recepsion 9 Qeshor.xls".`);
             continue;
           }
           let hv;
           try { hv = parseHotelBuffer(hf.buffer, hDate); }
           catch (e) { console.error(`  ERROR [hotel ${hf.filename}]: ${e.message}`); continue; }
-          console.log(`  ${hDate}: ${hv.nightsOccupied}/${TOTAL_ROOMS} = ${hv.occupancyPct}%  Rev: ${hv.revenue}`);
+          console.log(`  ${hf.filename} → ${hDate}: ${hv.nightsOccupied}/${TOTAL_ROOMS} = ${hv.occupancyPct}%  Rev: ${hv.revenue}`);
           updates.push({ isoDate: hDate, fnbValues: null, hotelValues: hv, writeFnb: false, writeHotel: true });
         }
       }
 
       if (updates.length === 0) {
-        console.error(`  ERROR: nothing usable to write for email ${msgId} — leaving it unprocessed`);
+        console.error(`  ERROR: nothing usable to write for email ${msgId} — leaving it UNPROCESSED for retry`);
         continue;
       }
       const dateList = [...new Set(updates.map(u => u.isoDate))].sort();
@@ -728,12 +780,21 @@ async function runCheck() {
 
       // Write every row to the Sample Power BI workbook in one download + upload
       console.log('\n Writing to Sample Power BI...');
-      await patchXlsx(drive, updates);
+      const results = await patchXlsx(drive, updates);
+      const written = results.filter(r => r.fnbWritten || r.hotelWritten);
 
-      // Write each date to the Flow Dashboard (GAS)
+      // If NOTHING landed (e.g. the date row wasn't found), do NOT mark the email
+      // processed — leave it so a fix + retry can fill it later.
+      if (written.length === 0) {
+        console.error(`  ⚠ No rows matched for email ${msgId} (dates ${dateList.join(', ')} not in sheet?) — leaving it UNPROCESSED.`);
+        lastCheckStatus = `warn — no rows matched for ${dateList.join(', ')}`;
+        continue;
+      }
+
+      // Write each successfully-landed date to the Flow Dashboard (GAS)
       console.log('\n Writing to Flow Dashboard...');
-      for (const u of updates) {
-        await callGasEndpoint(u.isoDate, u.hotelValues, u.fnbValues, { writeFnb: u.writeFnb, writeHotel: u.writeHotel });
+      for (const r of written) {
+        await callGasEndpoint(r.isoDate, r.hotelValues, r.fnbValues, { writeFnb: r.fnbWritten, writeHotel: r.hotelWritten });
       }
 
       // Mark this email as processed
@@ -747,8 +808,9 @@ async function runCheck() {
       lastProcessed = new Date().toISOString();
       totalProcessed++;
 
+      const writtenDates = [...new Set(written.map(r => r.isoDate))].sort();
       console.log('\n' + '═'.repeat(62));
-      console.log(` ✅ ${dateList.join(', ')} u shkrua saktë.`);
+      console.log(` ✅ ${writtenDates.join(', ')} u shkrua saktë.`);
       console.log('═'.repeat(62) + '\n');
     }
 
