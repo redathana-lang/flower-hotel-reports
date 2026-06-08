@@ -386,11 +386,98 @@ function readRefStyles(xml, refRowNum, colLetters) {
   return styles;
 }
 
-async function patchXlsx(drive, isoDate, fnbValues, hotelValues, opts = {}) {
-  // writeFnb / writeHotel let the caller fill ONLY the sheet(s) that had source
-  // files in the email. A sheet whose flag is false is left exactly as it was —
-  // so sending just the Prenotimet (reception) file updates Hotel without wiping F&B.
-  const { writeFnb = true, writeHotel = true } = opts;
+// Patch one F&B (sheet3) date row in-place. Returns the new XML, or null if the
+// date row wasn't found (sheet left unchanged).
+function patchFnbRow(fnbXml, isoDate, fnbValues) {
+  const fnbInfo = findRowForDate(fnbXml, isoDate);
+  if (!fnbInfo) {
+    console.error(`  FNB: date ${isoDate} not found in sheet!`);
+    return null;
+  }
+  const r   = fnbInfo.rowNum;
+  const ser = fnbInfo.serial;
+  console.log(`  FNB: date ${isoDate} → row ${r} (serial ${ser})`);
+
+  const ref = readRefStyles(fnbXml, r - 1, ['A','B','C','D','E','F','G','H']);
+  const sA  = ref?.A?.s || '23';
+  const sB  = ref?.B?.s || '36';
+  const sG  = ref?.G?.s || '34';
+  const sH  = ref?.H?.s || '35';
+  console.log(`    Styles from row ${r-1}: A=s${sA} B=s${sB} G=s${sG} H=s${sH}`);
+
+  const { B, C, D, E, F, G, H } = fnbValues;
+  const newRow =
+    `<row r="${r}" ht="14.25" customHeight="1">` +
+    `<c r="A${r}" s="${sA}"><v>${ser}.0</v></c>` +
+    `<c r="B${r}" s="${sB}"><v>${B}</v></c>` +
+    `<c r="C${r}" s="${sB}"><v>${C}</v></c>` +
+    `<c r="D${r}" s="${sB}"><v>${D}</v></c>` +
+    `<c r="E${r}" s="${sB}"><v>${E}</v></c>` +
+    `<c r="F${r}" s="${sB}"><v>${F}</v></c>` +
+    `<c r="G${r}" s="${sG}"><v>${G}</v></c>` +
+    `<c r="H${r}" s="${sH}"><f t="shared" si="1"/><v>${H}</v></c>` +
+    `</row>`;
+  console.log(`  ✓ FNB row ${r} written`);
+  return fnbXml.replace(new RegExp(`<row r="${r}"[^>]*>[\\s\\S]*?<\\/row>`), newRow);
+}
+
+// Patch one Hotel (sheet2) date row in-place. Returns the new XML, or null if the
+// date row wasn't found (sheet left unchanged).
+function patchHotelRow(hotelXml, isoDate, hotelValues) {
+  const hotelInfo = findRowForDate(hotelXml, isoDate);
+  if (!hotelInfo) {
+    console.error(`  Hotel: date ${isoDate} not found in sheet!`);
+    return null;
+  }
+  const r   = hotelInfo.rowNum;
+  const ser = hotelInfo.serial;
+  console.log(`  Hotel: date ${isoDate} → row ${r} (serial ${ser})`);
+
+  const ref  = readRefStyles(hotelXml, r - 1, ['A','B','C','D','E','F']);
+  const sA   = ref?.A?.s || '23';
+  const sB   = ref?.B?.s || '17';
+  const sBt  = ref?.B?.t || 's';
+  const sC   = ref?.C?.s || '24';
+  const sD   = ref?.D?.s || '27';
+  const sE   = ref?.E?.s || '17';
+  const sF   = ref?.F?.s || '28';
+  const refRow = hotelXml.match(new RegExp(`<row r="${r-1}"[^>]*>[\\s\\S]*?<\\/row>`))?.[0] || '';
+  const ssMatch = refRow.match(new RegExp(`<c r="B${r-1}"[^>]*><v>(\\d+)<\\/v><\\/c>`));
+  const ssIdx = ssMatch ? ssMatch[1] : '35';
+  console.log(`    Styles from row ${r-1}: A=s${sA} B=s${sB}(t=${sBt},ss=${ssIdx}) C=s${sC} D=s${sD} E=s${sE} F=s${sF}`);
+
+  const { nightsOccupied, nightsAvailable, revenue } = hotelValues;
+  // Preserve the per-day available rooms already in col E (maintained from Power BI;
+  // varies during June 2026). Recompute occupancy against it; fall back to the parsed
+  // default only when the cell is empty — never clobber a real availability value.
+  const curHotelRow = hotelXml.match(new RegExp(`<row r="${r}"[^>]*>[\\s\\S]*?<\\/row>`))?.[0] || '';
+  const curAvailM = curHotelRow.match(new RegExp(`<c r="E${r}"[^>]*><v>([\\d.]+)<\\/v>`));
+  const availRooms = (curAvailM && parseFloat(curAvailM[1]) > 0) ? parseFloat(curAvailM[1]) : nightsAvailable;
+  const occDecimal = availRooms > 0 ? nightsOccupied / availRooms : 0;
+  const newRow =
+    `<row r="${r}" ht="14.25" customHeight="1">` +
+    `<c r="A${r}" s="${sA}"><v>${ser}.0</v></c>` +
+    `<c r="B${r}" s="${sB}" t="${sBt}"><v>${ssIdx}</v></c>` +
+    `<c r="C${r}" s="${sC}"><f t="shared" si="1"/><v>${occDecimal}</v></c>` +
+    `<c r="D${r}" s="${sD}"><v>${nightsOccupied}.0</v></c>` +
+    `<c r="E${r}" s="${sE}"><v>${availRooms}</v></c>` +
+    `<c r="F${r}" s="${sF}"><v>${revenue}</v></c>` +
+    `</row>`;
+  console.log(`  ✓ Hotel row ${r} written`);
+  return hotelXml.replace(new RegExp(`<row r="${r}"[^>]*>[\\s\\S]*?<\\/row>`), newRow);
+}
+
+// Apply a batch of per-date updates to the workbook in ONE download + upload.
+// updates: [{ isoDate, fnbValues, hotelValues, writeFnb, writeHotel }]
+// Each update targets its own date row, so one email can carry several hotel
+// days (and/or an F&B day) and every one lands in the right row.
+async function patchXlsx(drive, updates) {
+  const list = (updates || []).filter(u => u && (u.writeFnb || u.writeHotel));
+  if (list.length === 0) {
+    console.log('  Nothing to write — no sheets flagged.');
+    return;
+  }
+
   console.log('\nDownloading XLSX from Google Drive...');
   const res = await drive.files.get(
     { fileId: XLSX_FILE_ID, alt: 'media' },
@@ -400,89 +487,27 @@ async function patchXlsx(drive, isoDate, fnbValues, hotelValues, opts = {}) {
   console.log(`  ${(buffer.length / 1024).toFixed(0)} KB`);
 
   const zip = await JSZip.loadAsync(buffer);
-
-  // ── FNB (sheet3.xml) ──────────────────────────────────────────
-  let fnbXml = await zip.file('xl/worksheets/sheet3.xml').async('string');
-  const fnbInfo = writeFnb ? findRowForDate(fnbXml, isoDate) : null;
-  if (!writeFnb) {
-    console.log('  FNB: no F&B file in this email — leaving sheet3 untouched');
-  } else if (!fnbInfo) {
-    console.error(`  FNB: date ${isoDate} not found in sheet!`);
-  } else {
-    const r   = fnbInfo.rowNum;
-    const ser = fnbInfo.serial;
-    console.log(`  FNB: date ${isoDate} → row ${r} (serial ${ser})`);
-
-    const ref = readRefStyles(fnbXml, r - 1, ['A','B','C','D','E','F','G','H']);
-    const sA  = ref?.A?.s || '23';
-    const sB  = ref?.B?.s || '36';
-    const sG  = ref?.G?.s || '34';
-    const sH  = ref?.H?.s || '35';
-    console.log(`    Styles from row ${r-1}: A=s${sA} B=s${sB} G=s${sG} H=s${sH}`);
-
-    const { B, C, D, E, F, G, H } = fnbValues;
-    const newRow =
-      `<row r="${r}" ht="14.25" customHeight="1">` +
-      `<c r="A${r}" s="${sA}"><v>${ser}.0</v></c>` +
-      `<c r="B${r}" s="${sB}"><v>${B}</v></c>` +
-      `<c r="C${r}" s="${sB}"><v>${C}</v></c>` +
-      `<c r="D${r}" s="${sB}"><v>${D}</v></c>` +
-      `<c r="E${r}" s="${sB}"><v>${E}</v></c>` +
-      `<c r="F${r}" s="${sB}"><v>${F}</v></c>` +
-      `<c r="G${r}" s="${sG}"><v>${G}</v></c>` +
-      `<c r="H${r}" s="${sH}"><f t="shared" si="1"/><v>${H}</v></c>` +
-      `</row>`;
-    fnbXml = fnbXml.replace(new RegExp(`<row r="${r}"[^>]*>[\\s\\S]*?<\\/row>`), newRow);
-    zip.file('xl/worksheets/sheet3.xml', fnbXml);
-    console.log(`  ✓ FNB row ${r} written`);
-  }
-
-  // ── Hotel (sheet2.xml) ────────────────────────────────────────
+  let fnbXml   = await zip.file('xl/worksheets/sheet3.xml').async('string');
   let hotelXml = await zip.file('xl/worksheets/sheet2.xml').async('string');
-  const hotelInfo = writeHotel ? findRowForDate(hotelXml, isoDate) : null;
-  if (!writeHotel) {
-    console.log('  Hotel: no Prenotimet/reception file in this email — leaving sheet2 untouched');
-  } else if (!hotelInfo) {
-    console.error(`  Hotel: date ${isoDate} not found in sheet!`);
-  } else {
-    const r   = hotelInfo.rowNum;
-    const ser = hotelInfo.serial;
-    console.log(`  Hotel: date ${isoDate} → row ${r} (serial ${ser})`);
+  let fnbChanged = false, hotelChanged = false;
 
-    const ref  = readRefStyles(hotelXml, r - 1, ['A','B','C','D','E','F']);
-    const sA   = ref?.A?.s || '23';
-    const sB   = ref?.B?.s || '17';
-    const sBt  = ref?.B?.t || 's';
-    const sC   = ref?.C?.s || '24';
-    const sD   = ref?.D?.s || '27';
-    const sE   = ref?.E?.s || '17';
-    const sF   = ref?.F?.s || '28';
-    const refRow = hotelXml.match(new RegExp(`<row r="${r-1}"[^>]*>[\\s\\S]*?<\\/row>`))?.[0] || '';
-    const ssMatch = refRow.match(new RegExp(`<c r="B${r-1}"[^>]*><v>(\\d+)<\\/v><\\/c>`));
-    const ssIdx = ssMatch ? ssMatch[1] : '35';
-    console.log(`    Styles from row ${r-1}: A=s${sA} B=s${sB}(t=${sBt},ss=${ssIdx}) C=s${sC} D=s${sD} E=s${sE} F=s${sF}`);
-
-    const { occupancyPct, nightsOccupied, nightsAvailable, revenue } = hotelValues;
-    // Preserve the per-day available rooms already in col E (maintained from Power BI;
-    // varies during June 2026). Recompute occupancy against it; fall back to the parsed
-    // default only when the cell is empty — never clobber a real availability value.
-    const curHotelRow = hotelXml.match(new RegExp(`<row r="${r}"[^>]*>[\\s\\S]*?<\\/row>`))?.[0] || '';
-    const curAvailM = curHotelRow.match(new RegExp(`<c r="E${r}"[^>]*><v>([\\d.]+)<\\/v>`));
-    const availRooms = (curAvailM && parseFloat(curAvailM[1]) > 0) ? parseFloat(curAvailM[1]) : nightsAvailable;
-    const occDecimal = availRooms > 0 ? nightsOccupied / availRooms : 0;
-    const newRow =
-      `<row r="${r}" ht="14.25" customHeight="1">` +
-      `<c r="A${r}" s="${sA}"><v>${ser}.0</v></c>` +
-      `<c r="B${r}" s="${sB}" t="${sBt}"><v>${ssIdx}</v></c>` +
-      `<c r="C${r}" s="${sC}"><f t="shared" si="1"/><v>${occDecimal}</v></c>` +
-      `<c r="D${r}" s="${sD}"><v>${nightsOccupied}.0</v></c>` +
-      `<c r="E${r}" s="${sE}"><v>${availRooms}</v></c>` +
-      `<c r="F${r}" s="${sF}"><v>${revenue}</v></c>` +
-      `</row>`;
-    hotelXml = hotelXml.replace(new RegExp(`<row r="${r}"[^>]*>[\\s\\S]*?<\\/row>`), newRow);
-    zip.file('xl/worksheets/sheet2.xml', hotelXml);
-    console.log(`  ✓ Hotel row ${r} written`);
+  for (const u of list) {
+    if (u.writeFnb) {
+      const next = patchFnbRow(fnbXml, u.isoDate, u.fnbValues);
+      if (next) { fnbXml = next; fnbChanged = true; }
+    }
+    if (u.writeHotel) {
+      const next = patchHotelRow(hotelXml, u.isoDate, u.hotelValues);
+      if (next) { hotelXml = next; hotelChanged = true; }
+    }
   }
+
+  if (!fnbChanged && !hotelChanged) {
+    console.log('  No rows matched — nothing uploaded.');
+    return;
+  }
+  if (fnbChanged)   zip.file('xl/worksheets/sheet3.xml', fnbXml);
+  if (hotelChanged) zip.file('xl/worksheets/sheet2.xml', hotelXml);
 
   const outBuf = await zip.generateAsync({
     type: 'nodebuffer', compression: 'DEFLATE', compressionOptions: { level: 6 }
@@ -595,11 +620,21 @@ async function runCheck() {
     for (const msgId of messageIds) {
       console.log(`Processing email ${msgId}...`);
       const attachments = await getAttachments(gmail, msgId);
-      const collected   = { restorant: null, pool_bar: null, poolbar_g: null, garden: null, beach_bar: null, hotel: null };
+      const collected   = { restorant: null, pool_bar: null, poolbar_g: null, garden: null, beach_bar: null };
+      const hotelFiles  = [];   // keep ALL hotel/reception files — one per day, each its own date row
       let hasReport = false;
 
       for (const { filename, buffer } of attachments) {
         let type = classifyFile(filename);
+
+        // Hotel/reception files: collect every one. A single email may carry several
+        // days of "Prenotimet ne recepsion" — each goes to its own date row later.
+        if (type === 'hotel') {
+          hotelFiles.push({ filename, buffer });
+          console.log(`    → hotel: ${filename}`);
+          hasReport = true;
+          continue;
+        }
 
         if (type === 'pool_bar' && collected['pool_bar']) {
           const contentType = classifyPoolBarByContent(buffer);
@@ -623,76 +658,83 @@ async function runCheck() {
           console.log(`    → Could not classify: ${filename}`);
         }
       }
-      if (hasReport) emailGroups.push({ msgId, collected });
+      if (hasReport) emailGroups.push({ msgId, collected, hotelFiles });
     }
 
-    for (const { msgId, collected } of emailGroups) {
-      // Extract date from Excel col[3] — NOT from today's date
-      let isoDate = null;
-      for (const key of ['restorant', 'pool_bar', 'garden', 'poolbar_g', 'beach_bar']) {
-        if (collected[key]) {
-          isoDate = extractDateFromBuffer(collected[key].buffer);
-          if (isoDate) break;
+    for (const { msgId, collected, hotelFiles } of emailGroups) {
+      // Each email may carry an F&B day (one combined row) and/or several hotel days
+      // (one row each). Build a list of per-date updates, then write them all at once.
+      const updates = [];
+
+      // ── F&B: one combined row for one date ────────────────────────────────
+      const hasFnb = ['restorant','pool_bar','poolbar_g','garden','beach_bar'].some(k => collected[k]);
+      if (hasFnb) {
+        let fnbDate = null;
+        for (const key of ['restorant', 'pool_bar', 'garden', 'poolbar_g', 'beach_bar']) {
+          if (collected[key]) { fnbDate = extractDateFromBuffer(collected[key].buffer); if (fnbDate) break; }
+        }
+        if (!fnbDate) {
+          console.error(`  ERROR: could not extract F&B date for email ${msgId}`);
+        } else {
+          console.log(`\n F&B date ${fnbDate} — parsing...`);
+          const fnb = { restorant: { revenue: 0, houseUse: 0 }, pool_bar: { revenue: 0, houseUse: 0 }, poolbar_g: { revenue: 0, houseUse: 0 }, garden: { revenue: 0, houseUse: 0 }, beach_bar: { revenue: 0, houseUse: 0 } };
+          for (const key of Object.keys(fnb)) {
+            if (collected[key]) {
+              try { fnb[key] = parseFnBBuffer(collected[key].buffer, key); }
+              catch (e) { console.error(`  ERROR [${key}]: ${e.message}`); }
+            } else {
+              console.log(`  [${key}] not provided — using 0`);
+            }
+          }
+          const totalHouseUse = Object.values(fnb).reduce((s, v) => s + v.houseUse, 0);
+          const houseUseNeg   = -(Math.round(totalHouseUse * 100) / 100);
+          const fnbValues = {
+            B: fnb.restorant.revenue,
+            C: fnb.pool_bar.revenue,
+            D: fnb.garden.revenue,
+            E: fnb.poolbar_g.revenue,
+            F: fnb.beach_bar.revenue,
+            G: houseUseNeg,
+            H: Math.round((fnb.restorant.revenue + fnb.pool_bar.revenue + fnb.garden.revenue + fnb.poolbar_g.revenue + fnb.beach_bar.revenue + houseUseNeg) * 100) / 100,
+          };
+          console.log(` F&B: R=${fnbValues.B} PB=${fnbValues.C} G=${fnbValues.D} PBG=${fnbValues.E} BB=${fnbValues.F} HU=${fnbValues.G} T=${fnbValues.H}`);
+          updates.push({ isoDate: fnbDate, fnbValues, hotelValues: null, writeFnb: true, writeHotel: false });
         }
       }
-      if (!isoDate && collected.hotel) {
-        isoDate = extractDateFromBuffer(collected.hotel.buffer);
+
+      // ── Hotel: one row per file, each at its own date ─────────────────────
+      if (hotelFiles.length) {
+        console.log(`\n Parsing Hotel (${hotelFiles.length} file(s))...`);
+        for (const hf of hotelFiles) {
+          const hDate = extractDateFromBuffer(hf.buffer);
+          if (!hDate) {
+            console.error(`  ERROR: no date in hotel file ${hf.filename} — skipped`);
+            continue;
+          }
+          let hv;
+          try { hv = parseHotelBuffer(hf.buffer, hDate); }
+          catch (e) { console.error(`  ERROR [hotel ${hf.filename}]: ${e.message}`); continue; }
+          console.log(`  ${hDate}: ${hv.nightsOccupied}/${TOTAL_ROOMS} = ${hv.occupancyPct}%  Rev: ${hv.revenue}`);
+          updates.push({ isoDate: hDate, fnbValues: null, hotelValues: hv, writeFnb: false, writeHotel: true });
+        }
       }
-      if (!isoDate) {
-        console.error(`  ERROR: could not extract date from Excel for email ${msgId}`);
+
+      if (updates.length === 0) {
+        console.error(`  ERROR: nothing usable to write for email ${msgId} — leaving it unprocessed`);
         continue;
       }
-      console.log(`\n  Data e raportit: ${isoDate}`);
+      const dateList = [...new Set(updates.map(u => u.isoDate))].sort();
+      console.log(`\n Dates in this email: ${dateList.join(', ')}`);
 
-      // Parse F&B
-      console.log('\n Parsing F&B...');
-      const fnb = { restorant: { revenue: 0, houseUse: 0 }, pool_bar: { revenue: 0, houseUse: 0 }, poolbar_g: { revenue: 0, houseUse: 0 }, garden: { revenue: 0, houseUse: 0 }, beach_bar: { revenue: 0, houseUse: 0 } };
-      for (const key of Object.keys(fnb)) {
-        if (collected[key]) {
-          try { fnb[key] = parseFnBBuffer(collected[key].buffer, key); }
-          catch (e) { console.error(`  ERROR [${key}]: ${e.message}`); }
-        } else {
-          console.log(`  [${key}] not provided — using 0`);
-        }
-      }
-
-      const totalHouseUse = Object.values(fnb).reduce((s, v) => s + v.houseUse, 0);
-      const houseUseNeg   = -(Math.round(totalHouseUse * 100) / 100);
-      const fnbValues = {
-        B: fnb.restorant.revenue,
-        C: fnb.pool_bar.revenue,
-        D: fnb.garden.revenue,
-        E: fnb.poolbar_g.revenue,
-        F: fnb.beach_bar.revenue,
-        G: houseUseNeg,
-        H: Math.round((fnb.restorant.revenue + fnb.pool_bar.revenue + fnb.garden.revenue + fnb.poolbar_g.revenue + fnb.beach_bar.revenue + houseUseNeg) * 100) / 100,
-      };
-      console.log(` F&B: R=${fnbValues.B} PB=${fnbValues.C} G=${fnbValues.D} PBG=${fnbValues.E} BB=${fnbValues.F} HU=${fnbValues.G} T=${fnbValues.H}`);
-
-      // Parse Hotel
-      console.log('\n Parsing Hotel...');
-      let hotelValues = { occupancyPct: 0, nightsOccupied: 0, nightsAvailable: TOTAL_ROOMS, revenue: 0 };
-      if (collected.hotel) {
-        try { hotelValues = parseHotelBuffer(collected.hotel.buffer, isoDate); }
-        catch (e) { console.error(`  ERROR [hotel]: ${e.message}`); }
-      } else {
-        console.log('  Hotel file not provided — using 0');
-      }
-      console.log(` Hotel: ${hotelValues.nightsOccupied}/${TOTAL_ROOMS} = ${hotelValues.occupancyPct}%  Rev: ${hotelValues.revenue}`);
-
-      // Only fill the sheet(s) this email actually carried files for. A hotel-only
-      // email updates Hotel and leaves F&B as-is; an F&B-only email does the reverse.
-      const hasHotel = !!collected.hotel;
-      const hasFnb   = ['restorant','pool_bar','poolbar_g','garden','beach_bar'].some(k => collected[k]);
-      console.log(`\n Sheets to fill: ${[hasHotel && 'Hotel', hasFnb && 'F&B'].filter(Boolean).join(' + ') || '(none)'}`);
-
-      // Write to Sample Power BI (XLSX)
+      // Write every row to the Sample Power BI workbook in one download + upload
       console.log('\n Writing to Sample Power BI...');
-      await patchXlsx(drive, isoDate, fnbValues, hotelValues, { writeFnb: hasFnb, writeHotel: hasHotel });
+      await patchXlsx(drive, updates);
 
-      // Write to Flow Dashboard (GAS)
+      // Write each date to the Flow Dashboard (GAS)
       console.log('\n Writing to Flow Dashboard...');
-      await callGasEndpoint(isoDate, hotelValues, fnbValues, { writeFnb: hasFnb, writeHotel: hasHotel });
+      for (const u of updates) {
+        await callGasEndpoint(u.isoDate, u.hotelValues, u.fnbValues, { writeFnb: u.writeFnb, writeHotel: u.writeHotel });
+      }
 
       // Mark this email as processed
       try {
@@ -706,7 +748,7 @@ async function runCheck() {
       totalProcessed++;
 
       console.log('\n' + '═'.repeat(62));
-      console.log(` ✅ ${isoDate} u shkrua saktë.`);
+      console.log(` ✅ ${dateList.join(', ')} u shkrua saktë.`);
       console.log('═'.repeat(62) + '\n');
     }
 
