@@ -150,10 +150,10 @@ async function authorize() {
 
 // ── GMAIL HELPERS ─────────────────────────────────────────────────────────────
 async function findReportEmails(gmail) {
-  const primaryQuery = 'subject:"Raporti Ditor" has:attachment -label:processed-report in:inbox';
+  const primaryQuery = '(subject:"Raporti Ditor" OR subject:"shpenzime ditore") has:attachment -label:processed-report in:inbox';
   const r1 = await gmail.users.messages.list({ userId: 'me', q: primaryQuery, maxResults: 20 });
   if ((r1.data.messages || []).length > 0) {
-    console.log('  (matched subject: Raporti Ditor)');
+    console.log('  (matched subject: Raporti Ditor / shpenzime ditore)');
     return r1.data.messages.map(m => m.id);
   }
   const fallbackQuery = 'has:attachment -label:processed-report in:inbox';
@@ -298,6 +298,75 @@ function extractDateFromBuffer(buffer) {
     if (iso) return iso;
   }
   return null;
+}
+
+// ── DAILY EXPENSES (purchases report → sheet5 "DAILY EXPENSES") ────────────────
+// The purchases ("Blerjet") export lists one section per warehouse ("Magazina: X")
+// whose daily total sits under the "Vlera sipas mon. standarte" column. Each
+// magazine maps to a column of the DAILY EXPENSES sheet (dates are rows).
+const EXP_COL_MAP = {
+  'bufe':'G', 'restorant':'C', 'flower restorant':'C', 'pool bar':'D', 'pool bar garden':'F',
+  'beach bar':'B', 'brutal':'E', 'garden brutal':'E', 'magazina qendrore':'I',
+  'operacionale mikse':'J', 'familja':'N', 'spa':'K', 'magazina garden':'P',
+  'magazina garden (investime)':'P', 'investime':'P', 'shpenzime hoteli':'O',
+  'marketing':'M', 'mirembajtje':'L', 'mirembajtje dhe riparime':'L',
+  'paga':'Q', 'paga & utilitete':'Q', 'overheads':'H', 'overheads f&b':'H',
+};
+const EXP_EXCLUDE = ['flower tirane', 'tirane']; // separate property — not on this sheet
+const normMag = s => String(s || '').toLowerCase().replace(/\s+/g, ' ').trim().replace(/[.:]+$/, '').trim();
+
+// True if the workbook looks like a purchases report (has the standard-currency
+// column AND "Magazina:" section rows) — used to route attachments to expenses.
+function isExpenseReport(buffer) {
+  try {
+    const wb = XLSX.read(buffer, { type: 'buffer', raw: true });
+    const ws = wb.Sheets[wb.SheetNames[0]];
+    const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '', raw: true });
+    let hasStd = false, hasMag = false;
+    for (let i = 0; i < Math.min(rows.length, 80); i++) {
+      const line = rows[i].map(c => String(c)).join(' ').toLowerCase();
+      if (line.includes('vlera sipas mon')) hasStd = true;
+      if (/magazina:/i.test(line)) hasMag = true;
+      if (hasStd && hasMag) return true;
+    }
+    return false;
+  } catch (e) { return false; }
+}
+
+// Parse a purchases report → { serial, isoDate, mags:{ NAME: value } }.
+// Report date = the most common floored invoice-date serial ("Data Faturës" column).
+function parseExpensesBuffer(buffer) {
+  const wb = XLSX.read(buffer, { type: 'buffer', raw: true });
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '', raw: true });
+  let hdr = -1, colStd = -1, colDate = -1;
+  for (let i = 0; i < Math.min(rows.length, 12); i++) {
+    const std = rows[i].findIndex(c => String(c).toLowerCase().includes('vlera sipas mon'));
+    if (std >= 0) { hdr = i; colStd = std; colDate = rows[i].findIndex(c => String(c).toLowerCase().includes('data fatur')); break; }
+  }
+  if (colStd < 0) return null;
+  const mags = {}; const serials = [];
+  for (let i = hdr + 1; i < rows.length; i++) {
+    const r = rows[i]; const c0 = String(r[0] || '').trim();
+    if (/^Magazina:/i.test(c0)) mags[c0.replace(/^Magazina:\s*/i, '').trim()] = parseNum(r[colStd]);
+    if (colDate >= 0 && typeof r[colDate] === 'number' && r[colDate] > 40000) serials.push(Math.floor(r[colDate]));
+  }
+  const freq = {}; serials.forEach(s => freq[s] = (freq[s] || 0) + 1);
+  const serial = Object.keys(freq).sort((a, b) => freq[b] - freq[a])[0];
+  return { serial: serial ? parseInt(serial) : null, isoDate: serial ? excelSerialToISO(serial) : null, mags };
+}
+
+// Map magazine totals → { expValues:{ COL: value }, unmapped:[names] }. 2-dec rounded.
+function mapExpenseMagazines(mags) {
+  const expValues = {}; const unmapped = [];
+  for (const [name, val] of Object.entries(mags)) {
+    const key = normMag(name);
+    if (EXP_EXCLUDE.includes(key)) continue;
+    const col = EXP_COL_MAP[key];
+    if (!col) { unmapped.push(name); continue; }
+    expValues[col] = Math.round(((expValues[col] || 0) + val) * 100) / 100;
+  }
+  return { expValues, unmapped };
 }
 
 function parseFnBBuffer(buffer, label) {
@@ -510,12 +579,52 @@ function patchHotelRow(hotelXml, isoDate, hotelValues) {
   return hotelXml.replace(new RegExp(`<row r="${r}"[^>]*>[\\s\\S]*?<\\/row>`), newRow);
 }
 
+// Read a numeric cell value from a row's XML (0 if empty / not present).
+function readCellVal(rowXml, col, r) {
+  const m = rowXml.match(new RegExp(`<c r="${col}${r}"[^>]*?>(?:<f[^>]*\\/?>(?:[^<]*<\\/f>)?)?<v>([\\d.\\-]+)<\\/v>`));
+  return m ? parseFloat(m[1]) : 0;
+}
+
+// Patch one DAILY EXPENSES (sheet5) date row — SELECTIVE per-column update: only the
+// magazine columns from the report are touched, every other cell (Beach Bar, SPA,
+// Paga & Utilitete, manual entries…) is preserved. TOTAL (col R) is recomputed but
+// keeps its shared formula. Returns the new XML, or null if the date row wasn't found.
+function patchExpensesRow(expXml, isoDate, expValues) {
+  const info = findRowForDate(expXml, isoDate);
+  if (!info) { console.error(`  EXP: date ${isoDate} not found in DAILY EXPENSES sheet!`); return null; }
+  const r = info.rowNum;
+  const rowXml = expXml.match(new RegExp(`<row r="${r}"[^>]*>[\\s\\S]*?<\\/row>`))?.[0];
+  if (!rowXml) { console.error(`  EXP: row ${r} XML not found`); return null; }
+  console.log(`  EXP: date ${isoDate} → row ${r} (serial ${info.serial})`);
+
+  let newRow = rowXml;
+  for (const [col, val] of Object.entries(expValues)) {
+    const existing = newRow.match(new RegExp(`<c r="${col}${r}"([^>]*?)(?:\\/>|>[\\s\\S]*?<\\/c>)`));
+    let style = '90'; // filled-number style
+    if (existing) { const sm = existing[1].match(/\bs="(\d+)"/); if (sm) style = (sm[1] === '22' ? '90' : sm[1]); }
+    const cell = `<c r="${col}${r}" s="${style}"><v>${val}</v></c>`;
+    newRow = newRow.replace(new RegExp(`<c r="${col}${r}"(?:[^>]*\\/>|[^>]*>[\\s\\S]*?<\\/c>)`), cell);
+  }
+  // Recompute TOTAL (col R) = sum of B..Q, preserving its shared formula + style.
+  let total = 0;
+  'BCDEFGHIJKLMNOPQ'.split('').forEach(c => { total += (expValues[c] != null ? expValues[c] : readCellVal(newRow, c, r)); });
+  total = Math.round(total * 100) / 100;
+  const rM = newRow.match(new RegExp(`<c r="R${r}"([^>]*?)>([\\s\\S]*?)<\\/c>`));
+  const rStyle = (rM && rM[1].match(/\bs="(\d+)"/)) ? rM[1].match(/\bs="(\d+)"/)[1] : '27';
+  const fM = rM ? rM[2].match(/<f[^>]*\/>|<f[^>]*>[\s\S]*?<\/f>/) : null;
+  const rCell = `<c r="R${r}" s="${rStyle}">${fM ? fM[0] : '<f t="shared" si="1"/>'}<v>${total}</v></c>`;
+  newRow = newRow.replace(new RegExp(`<c r="R${r}"(?:[^>]*\\/>|[^>]*>[\\s\\S]*?<\\/c>)`), rCell);
+
+  console.log(`  ✓ EXP row ${r} updated: ${Object.entries(expValues).map(([c, v]) => c + '=' + v).join(' ')} → TOTAL ${total}`);
+  return expXml.replace(rowXml, newRow);
+}
+
 // Apply a batch of per-date updates to the workbook in ONE download + upload.
-// updates: [{ isoDate, fnbValues, hotelValues, writeFnb, writeHotel }]
+// updates: [{ isoDate, fnbValues, hotelValues, expValues, writeFnb, writeHotel, writeExp }]
 // Each update targets its own date row, so one email can carry several hotel
-// days (and/or an F&B day) and every one lands in the right row.
+// days (and/or an F&B day, and/or a daily-expenses day) and every one lands right.
 async function patchXlsx(drive, updates) {
-  const list = (updates || []).filter(u => u && (u.writeFnb || u.writeHotel));
+  const list = (updates || []).filter(u => u && (u.writeFnb || u.writeHotel || u.writeExp));
   if (list.length === 0) {
     console.log('  Nothing to write — no sheets flagged.');
     return [];
@@ -532,11 +641,12 @@ async function patchXlsx(drive, updates) {
   const zip = await JSZip.loadAsync(buffer);
   let fnbXml   = await zip.file('xl/worksheets/sheet3.xml').async('string');
   let hotelXml = await zip.file('xl/worksheets/sheet2.xml').async('string');
-  let fnbChanged = false, hotelChanged = false;
+  let expXml   = await zip.file('xl/worksheets/sheet5.xml').async('string');
+  let fnbChanged = false, hotelChanged = false, expChanged = false;
 
   // Mirror each update with whether its row actually landed (date row found).
   const results = list.map(u => {
-    let fnbWritten = false, hotelWritten = false;
+    let fnbWritten = false, hotelWritten = false, expWritten = false;
     if (u.writeFnb) {
       const next = patchFnbRow(fnbXml, u.isoDate, u.fnbValues);
       if (next) { fnbXml = next; fnbChanged = true; fnbWritten = true; }
@@ -545,15 +655,20 @@ async function patchXlsx(drive, updates) {
       const next = patchHotelRow(hotelXml, u.isoDate, u.hotelValues);
       if (next) { hotelXml = next; hotelChanged = true; hotelWritten = true; }
     }
-    return { isoDate: u.isoDate, fnbValues: u.fnbValues, hotelValues: u.hotelValues, fnbWritten, hotelWritten };
+    if (u.writeExp) {
+      const next = patchExpensesRow(expXml, u.isoDate, u.expValues);
+      if (next) { expXml = next; expChanged = true; expWritten = true; }
+    }
+    return { isoDate: u.isoDate, fnbValues: u.fnbValues, hotelValues: u.hotelValues, expValues: u.expValues, fnbWritten, hotelWritten, expWritten };
   });
 
-  if (!fnbChanged && !hotelChanged) {
+  if (!fnbChanged && !hotelChanged && !expChanged) {
     console.log('  No rows matched — nothing uploaded.');
     return results;
   }
   if (fnbChanged)   zip.file('xl/worksheets/sheet3.xml', fnbXml);
   if (hotelChanged) zip.file('xl/worksheets/sheet2.xml', hotelXml);
+  if (expChanged)   zip.file('xl/worksheets/sheet5.xml', expXml);
 
   const outBuf = await zip.generateAsync({
     type: 'nodebuffer', compression: 'DEFLATE', compressionOptions: { level: 6 }
@@ -669,9 +784,18 @@ async function runCheck() {
       const { files, subject, year } = await getAttachments(gmail, msgId);
       const collected   = { restorant: null, pool_bar: null, poolbar_g: null, garden: null, beach_bar: null };
       const hotelFiles  = [];   // keep ALL hotel/reception files — one per day, each its own date row
+      const expenseFiles = [];  // purchases ("Blerjet") reports → DAILY EXPENSES sheet
       let hasReport = false;
 
       for (const { filename, buffer } of files) {
+        // Purchases report (detected by content) → daily expenses, regardless of filename.
+        if (isExpenseReport(buffer)) {
+          expenseFiles.push({ filename, buffer });
+          console.log(`    → expenses: ${filename}`);
+          hasReport = true;
+          continue;
+        }
+
         let type = classifyFile(filename);
 
         // Hotel/reception files: collect every one. A single email may carry several
@@ -705,10 +829,10 @@ async function runCheck() {
           console.log(`    → Could not classify: ${filename}`);
         }
       }
-      if (hasReport) emailGroups.push({ msgId, collected, hotelFiles, subject, year });
+      if (hasReport) emailGroups.push({ msgId, collected, hotelFiles, expenseFiles, subject, year });
     }
 
-    for (const { msgId, collected, hotelFiles, subject, year } of emailGroups) {
+    for (const { msgId, collected, hotelFiles, expenseFiles, subject, year } of emailGroups) {
       // Each email may carry an F&B day (one combined row) and/or several hotel days
       // (one row each). Build a list of per-date updates, then write them all at once.
       const updates = [];
@@ -776,6 +900,22 @@ async function runCheck() {
         }
       }
 
+      // ── Daily Expenses: one row per purchases report, at the report's own date ──
+      if (expenseFiles.length) {
+        console.log(`\n Parsing Daily Expenses (${expenseFiles.length} file(s))...`);
+        for (const ef of expenseFiles) {
+          let parsed;
+          try { parsed = parseExpensesBuffer(ef.buffer); }
+          catch (e) { console.error(`  ERROR [expenses ${ef.filename}]: ${e.message}`); continue; }
+          if (!parsed || !parsed.isoDate) { console.error(`  ERROR: could not read date from "${ef.filename}" — skipped.`); continue; }
+          const { expValues, unmapped } = mapExpenseMagazines(parsed.mags);
+          if (unmapped.length) console.warn(`  ⚠ EXP unmapped magazines (skipped): ${unmapped.join(', ')}`);
+          if (Object.keys(expValues).length === 0) { console.error(`  ERROR: no mappable magazines in "${ef.filename}" — skipped.`); continue; }
+          console.log(`  ${ef.filename} → ${parsed.isoDate}: ${Object.entries(expValues).map(([c, v]) => c + '=' + v).join(' ')}`);
+          updates.push({ isoDate: parsed.isoDate, fnbValues: null, hotelValues: null, expValues, writeFnb: false, writeHotel: false, writeExp: true });
+        }
+      }
+
       if (updates.length === 0) {
         console.error(`  ERROR: nothing usable to write for email ${msgId} — leaving it UNPROCESSED for retry`);
         continue;
@@ -786,7 +926,7 @@ async function runCheck() {
       // Write every row to the Sample Power BI workbook in one download + upload
       console.log('\n Writing to Sample Power BI...');
       const results = await patchXlsx(drive, updates);
-      const written = results.filter(r => r.fnbWritten || r.hotelWritten);
+      const written = results.filter(r => r.fnbWritten || r.hotelWritten || r.expWritten);
 
       // If NOTHING landed (e.g. the date row wasn't found), do NOT mark the email
       // processed — leave it so a fix + retry can fill it later.
@@ -796,10 +936,14 @@ async function runCheck() {
         continue;
       }
 
-      // Write each successfully-landed date to the Flow Dashboard (GAS)
-      console.log('\n Writing to Flow Dashboard...');
-      for (const r of written) {
-        await callGasEndpoint(r.isoDate, r.hotelValues, r.fnbValues, { writeFnb: r.fnbWritten, writeHotel: r.hotelWritten });
+      // Write each successfully-landed F&B/hotel date to the Flow Dashboard (GAS).
+      // Daily-expenses rows live only in the workbook (no GAS handler) — skip those.
+      const gasWritten = written.filter(r => r.fnbWritten || r.hotelWritten);
+      if (gasWritten.length) {
+        console.log('\n Writing to Flow Dashboard...');
+        for (const r of gasWritten) {
+          await callGasEndpoint(r.isoDate, r.hotelValues, r.fnbValues, { writeFnb: r.fnbWritten, writeHotel: r.hotelWritten });
+        }
       }
 
       // Mark this email as processed
