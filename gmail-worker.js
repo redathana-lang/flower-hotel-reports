@@ -150,7 +150,12 @@ async function authorize() {
 
 // ── GMAIL HELPERS ─────────────────────────────────────────────────────────────
 async function findReportEmails(gmail) {
-  const primaryQuery = '(subject:"Raporti Ditor" OR subject:"shpenzime ditore") has:attachment -label:processed-report in:inbox';
+  // Match the real subject variants the hotel uses: "Raporti Ditor", "Raport Ditor Data …",
+  // "Raport Data …" (no "i"), "shpenzime ditore", a standalone "Blerjet …" purchases send,
+  // and "Prenotimet …" reception-only sends. The content-based routing still decides what
+  // each attachment is; this only makes sure the email is picked up promptly (not just via
+  // the catch-all fallback). Tokens are distinct in Gmail, so list both Raport and Raporti.
+  const primaryQuery = '(subject:Raporti OR subject:Raport OR subject:shpenzime OR subject:blerjet OR subject:Prenotimet) has:attachment -label:processed-report in:inbox';
   const r1 = await gmail.users.messages.list({ userId: 'me', q: primaryQuery, maxResults: 20 });
   if ((r1.data.messages || []).length > 0) {
     console.log('  (matched subject: Raporti Ditor / shpenzime ditore)');
