@@ -362,7 +362,10 @@ function mapExpenseMagazines(mags) {
   for (const [name, val] of Object.entries(mags)) {
     const key = normMag(name);
     if (EXP_EXCLUDE.includes(key)) continue;
-    const col = EXP_COL_MAP[key];
+    // Exact match first (keeps literal-"&" keys like "overheads f&b" / "paga & utilitete"),
+    // then a fallback that reads "&" as Albanian "dhe" so "mirembajtje & riparime" → …"dhe"… → L,
+    // and any future "X & Y" warehouse resolves without a new key.
+    const col = EXP_COL_MAP[key] || EXP_COL_MAP[key.replace(/\s*&\s*/g, ' dhe ')];
     if (!col) { unmapped.push(name); continue; }
     expValues[col] = Math.round(((expValues[col] || 0) + val) * 100) / 100;
   }
