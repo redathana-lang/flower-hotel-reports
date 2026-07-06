@@ -150,12 +150,16 @@ async function authorize() {
 
 // ── GMAIL HELPERS ─────────────────────────────────────────────────────────────
 async function findReportEmails(gmail) {
-  // Match the real subject variants the hotel uses: "Raporti Ditor", "Raport Ditor Data …",
-  // "Raport Data …" (no "i"), "shpenzime ditore", a standalone "Blerjet …" purchases send,
-  // and "Prenotimet …" reception-only sends. The content-based routing still decides what
-  // each attachment is; this only makes sure the email is picked up promptly (not just via
-  // the catch-all fallback). Tokens are distinct in Gmail, so list both Raport and Raporti.
-  const primaryQuery = '(subject:Raporti OR subject:Raport OR subject:shpenzime OR subject:blerjet OR subject:Prenotimet) has:attachment -label:processed-report in:inbox';
+  // Match on BOTH the subject AND the attachment file names, so a send is picked up even
+  // when the subject is unusual (e.g. a standalone expenses email titled just "Blerjet"):
+  //  · subject variants the hotel uses: "Raporti Ditor", "Raport Ditor Data …",
+  //    "Raport Data …" (no "i"), "shpenzime ditore", a "Blerjet …" send, "Prenotimet …".
+  //  · filename: matches the attachment names — "Blerjet Data ….xls" (expenses),
+  //    "Prenotimet ne recepsion.xls" (hotel) — regardless of what the subject says.
+  // The content-based routing still decides what each attachment actually is; this only
+  // makes sure the email is picked up promptly (not just via the catch-all fallback).
+  // Gmail tokens are distinct, so list both Raport and Raporti.
+  const primaryQuery = '(subject:Raporti OR subject:Raport OR subject:shpenzime OR subject:blerjet OR subject:Prenotimet OR filename:blerjet OR filename:shpenzime OR filename:prenotimet) has:attachment -label:processed-report in:inbox';
   const r1 = await gmail.users.messages.list({ userId: 'me', q: primaryQuery, maxResults: 20 });
   if ((r1.data.messages || []).length > 0) {
     console.log('  (matched subject: Raporti Ditor / shpenzime ditore)');
@@ -796,8 +800,12 @@ async function runCheck() {
       let hasReport = false;
 
       for (const { filename, buffer } of files) {
-        // Purchases report (detected by content) → daily expenses, regardless of filename.
-        if (isExpenseReport(buffer)) {
+        // Purchases report → daily expenses. Detected by CONTENT (the "Vlera sipas mon" +
+        // "Magazina:" structure) OR by the file NAME ("Blerjet …" / "Shpenzime …"), so a
+        // format variant that the content check might miss still routes here. If the file
+        // then turns out not to be a real purchases report, parseExpensesBuffer returns
+        // null / no magazines and it's skipped downstream — safe either way.
+        if (isExpenseReport(buffer) || /blerje|shpenzim/i.test(filename)) {
           expenseFiles.push({ filename, buffer });
           console.log(`    → expenses: ${filename}`);
           hasReport = true;
