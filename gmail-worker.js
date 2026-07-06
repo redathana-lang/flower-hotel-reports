@@ -64,6 +64,9 @@ function isHouseUse(tableStr) {
 }
 
 // ── STATUS TRACKING (for /health endpoint) ────────────────────────────────────
+// Bump BUILD on each deploy that matters so `GET /` can confirm what's actually live
+// (Render's autodeploy has been known to lag/stick behind origin/master here).
+const BUILD          = 'expenses-by-name+filename-2026-07-06';
 let lastCheckTime    = null;
 let lastCheckStatus  = 'not started';
 let lastProcessed    = null;
@@ -78,6 +81,7 @@ function startHealthServer() {
     res.json({
       service:       'Flower Hotel Gmail Report Processor',
       status:        'running',
+      build:         BUILD,
       checkInterval: `${CHECK_INTERVAL_MS / 60000} minutes`,
       lastCheck:     lastCheckTime,
       lastStatus:    lastCheckStatus,
