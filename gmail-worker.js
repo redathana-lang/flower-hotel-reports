@@ -631,6 +631,31 @@ function patchExpensesRow(expXml, isoDate, expValues) {
   return expXml.replace(rowXml, newRow);
 }
 
+// Resolve the worksheet XML path for a sheet by its DISPLAY NAME, via workbook.xml
+// + rels. Hardcoding sheetN.xml is unsafe: a workbook re-save can renumber the
+// physical files. On 2026-07-06 exactly this happened — DAILY EXPENSES moved from
+// sheet5.xml to sheet4.xml and sheet5.xml became DAILY CASH FLOW, so expenses were
+// being written into the cash-flow sheet. Resolving by name is re-save-proof.
+async function resolveSheetPath(zip, wantName) {
+  const wb   = await zip.file('xl/workbook.xml').async('string');
+  const rels = await zip.file('xl/_rels/workbook.xml.rels').async('string');
+  const relMap = {};
+  for (const m of rels.matchAll(/<Relationship\b[^>]*\bId="([^"]+)"[^>]*\bTarget="([^"]+)"/g)) relMap[m[1]] = m[2];
+  const decode = s => String(s).replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'");
+  const norm   = s => decode(s).toUpperCase().replace(/\s+/g, ' ').trim();
+  const want   = norm(wantName);
+  for (const m of wb.matchAll(/<sheet\b[^>]*\/>/g)) {
+    const tag  = m[0];
+    const name = (tag.match(/\bname="([^"]*)"/) || [])[1];
+    const rid  = (tag.match(/\br:id="([^"]*)"/) || [])[1];
+    if (name && norm(name) === want && relMap[rid]) {
+      const t = relMap[rid].replace(/^\/?xl\//, '');
+      return 'xl/' + (t.startsWith('worksheets/') ? t : 'worksheets/' + t);
+    }
+  }
+  throw new Error(`sheet "${wantName}" not found in workbook.xml`);
+}
+
 // Apply a batch of per-date updates to the workbook in ONE download + upload.
 // updates: [{ isoDate, fnbValues, hotelValues, expValues, writeFnb, writeHotel, writeExp }]
 // Each update targets its own date row, so one email can carry several hotel
@@ -651,9 +676,14 @@ async function patchXlsx(drive, updates) {
   console.log(`  ${(buffer.length / 1024).toFixed(0)} KB`);
 
   const zip = await JSZip.loadAsync(buffer);
-  let fnbXml   = await zip.file('xl/worksheets/sheet3.xml').async('string');
-  let hotelXml = await zip.file('xl/worksheets/sheet2.xml').async('string');
-  let expXml   = await zip.file('xl/worksheets/sheet5.xml').async('string');
+  // Resolve each sheet by name (re-save-proof), not by a hardcoded sheetN.xml.
+  const fnbPath   = await resolveSheetPath(zip, 'DAILY F&B REVENUES');
+  const hotelPath = await resolveSheetPath(zip, 'HOTEL DAILY PERFORMANCE');
+  const expPath   = await resolveSheetPath(zip, 'DAILY EXPENSES');
+  console.log(`  sheets → F&B:${fnbPath} Hotel:${hotelPath} Expenses:${expPath}`);
+  let fnbXml   = await zip.file(fnbPath).async('string');
+  let hotelXml = await zip.file(hotelPath).async('string');
+  let expXml   = await zip.file(expPath).async('string');
   let fnbChanged = false, hotelChanged = false, expChanged = false;
 
   // Mirror each update with whether its row actually landed (date row found).
@@ -678,9 +708,9 @@ async function patchXlsx(drive, updates) {
     console.log('  No rows matched — nothing uploaded.');
     return results;
   }
-  if (fnbChanged)   zip.file('xl/worksheets/sheet3.xml', fnbXml);
-  if (hotelChanged) zip.file('xl/worksheets/sheet2.xml', hotelXml);
-  if (expChanged)   zip.file('xl/worksheets/sheet5.xml', expXml);
+  if (fnbChanged)   zip.file(fnbPath, fnbXml);
+  if (hotelChanged) zip.file(hotelPath, hotelXml);
+  if (expChanged)   zip.file(expPath, expXml);
 
   const outBuf = await zip.generateAsync({
     type: 'nodebuffer', compression: 'DEFLATE', compressionOptions: { level: 6 }
