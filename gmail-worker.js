@@ -66,7 +66,7 @@ function isHouseUse(tableStr) {
 // ── STATUS TRACKING (for /health endpoint) ────────────────────────────────────
 // Bump BUILD on each deploy that matters so `GET /` can confirm what's actually live
 // (Render's autodeploy has been known to lag/stick behind origin/master here).
-const BUILD          = 'expenses-by-name+filename-2026-07-06';
+const BUILD          = 'hotel-xlsx-endpoint-2026-08-01';
 let lastCheckTime    = null;
 let lastCheckStatus  = 'not started';
 let lastProcessed    = null;
@@ -76,6 +76,7 @@ let checkCount       = 0;
 // ── EXPRESS HEALTH SERVER ─────────────────────────────────────────────────────
 function startHealthServer() {
   const app = express();
+  app.use(express.json({ limit: '256kb' }));
 
   app.get('/', (req, res) => {
     res.json({
@@ -94,6 +95,47 @@ function startHealthServer() {
 
   app.get('/health', (req, res) => {
     res.json({ status: 'ok', uptime: Math.floor(process.uptime()) + 's' });
+  });
+
+  // ── HOTEL DAILY PERFORMANCE push (from the FLOW dashboard's nightly
+  //    KontrolloPrenotimet ingest). Writes the Sample Power BI xlsx directly,
+  //    reusing the SAME tested patchXlsx()/patchHotelRow() the daily email
+  //    pipeline uses — because Apps Script / the Sheets API cannot write an
+  //    .xlsx. Body is the exact payload the dashboard already sends to
+  //    KONTROLLO_PUSH_URLS: { action:'hotel_performance', date:'YYYY-MM-DD',
+  //    nightsOccupied, nightsAvailable, revenue }. Upserts by date row; if the
+  //    date row doesn't exist yet, hotelWritten=false (row must be pre-created,
+  //    same rule as the email pipeline).
+  app.post('/api/hotel-xlsx', async (req, res) => {
+    try {
+      const b = req.body || {};
+      if (process.env.HOTEL_PUSH_TOKEN && b.token !== process.env.HOTEL_PUSH_TOKEN) {
+        return res.status(403).json({ ok: false, error: 'bad token' });
+      }
+      const m = String(b.date || '').match(/\d{4}-\d{2}-\d{2}/);
+      if (!m) return res.status(400).json({ ok: false, error: 'missing/invalid date (need YYYY-MM-DD)' });
+      const isoDate = m[0];
+      const hotelValues = {
+        nightsOccupied:  Number(b.nightsOccupied),
+        nightsAvailable: Number(b.nightsAvailable) || TOTAL_ROOMS,
+        revenue:         Number(b.revenue) || 0,
+      };
+      if (!Number.isFinite(hotelValues.nightsOccupied)) {
+        return res.status(400).json({ ok: false, error: 'missing/invalid nightsOccupied' });
+      }
+      const auth  = await authorize();
+      const drive = google.drive({ version: 'v3', auth });
+      const results = await patchXlsx(drive, [
+        { isoDate, hotelValues, fnbValues: null, expValues: null,
+          writeFnb: false, writeHotel: true, writeExp: false },
+      ]);
+      const r = results[0] || {};
+      console.log(`[hotel-xlsx] ${isoDate} → ${hotelValues.nightsOccupied}/${hotelValues.nightsAvailable} rev ${hotelValues.revenue} · written=${!!r.hotelWritten}`);
+      return res.json({ ok: !!r.hotelWritten, date: isoDate, hotelWritten: !!r.hotelWritten, hotelValues });
+    } catch (e) {
+      console.error('[hotel-xlsx] error:', e.message);
+      return res.status(500).json({ ok: false, error: e.message });
+    }
   });
 
   app.listen(PORT, () => {
