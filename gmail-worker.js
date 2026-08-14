@@ -312,7 +312,7 @@ function excelSerialToISO(serial) {
 // (e.g. "Prenotimet ne recepsion 9 Qeshor.xls"). Parse it from there.
 const SQ_MONTHS = {
   janar: 1, shkurt: 2, mars: 3, prill: 4, maj: 5, qershor: 6, qeshor: 6,
-  korrik: 7, gusht: 8, shtator: 9, tetor: 10, nentor: 11, 'nëntor': 11, dhjetor: 12,
+  korrik: 7, gusht: 8, guhst: 8, gusth: 8, shtator: 9, tetor: 10, nentor: 11, 'nëntor': 11, dhjetor: 12,
 };
 function parseReportDateFromName(text, fallbackYear) {
   if (!text) return null;
@@ -637,6 +637,18 @@ function patchHotelRow(hotelXml, isoDate, hotelValues) {
   return hotelXml.replace(new RegExp(`<row r="${r}"[^>]*>[\\s\\S]*?<\\/row>`), newRow);
 }
 
+// True when the HOTEL DAILY PERFORMANCE row for isoDate already carries an
+// occupancy figure (col D > 0). Used to let the automated Trinosoft feed win:
+// the manual "Prenotimet ne recepsion" file may FILL an empty day but must never
+// overwrite a day the KontrolloPrenotimet pipeline already computed, because the
+// manual parser applies no date filtering and sweeps in other days' bookings.
+function hotelRowHasData(hotelXml, isoDate) {
+  const info = findRowForDate(hotelXml, isoDate);
+  if (!info) return false;
+  const rowXml = hotelXml.match(new RegExp(`<row r="${info.rowNum}"[^>]*>[\\s\\S]*?<\\/row>`))?.[0] || '';
+  return readCellVal(rowXml, 'D', info.rowNum) > 0;
+}
+
 // Read a numeric cell value from a row's XML (0 if empty / not present).
 function readCellVal(rowXml, col, r) {
   const m = rowXml.match(new RegExp(`<c r="${col}${r}"[^>]*?>(?:<f[^>]*\\/?>(?:[^<]*<\\/f>)?)?<v>([\\d.\\-]+)<\\/v>`));
@@ -734,20 +746,27 @@ async function patchXlsx(drive, updates) {
 
   // Mirror each update with whether its row actually landed (date row found).
   const results = list.map(u => {
-    let fnbWritten = false, hotelWritten = false, expWritten = false;
+    let fnbWritten = false, hotelWritten = false, expWritten = false, hotelSkipped = false;
     if (u.writeFnb) {
       const next = patchFnbRow(fnbXml, u.isoDate, u.fnbValues);
       if (next) { fnbXml = next; fnbChanged = true; fnbWritten = true; }
     }
     if (u.writeHotel) {
-      const next = patchHotelRow(hotelXml, u.isoDate, u.hotelValues);
-      if (next) { hotelXml = next; hotelChanged = true; hotelWritten = true; }
+      // Trinosoft wins: never let the manual reception file overwrite a day the
+      // automated KontrolloPrenotimet feed already filled (owner's call 2026-08-07).
+      if (u.hotelDeferToExisting && hotelRowHasData(hotelXml, u.isoDate)) {
+        hotelSkipped = true;
+        console.log(`  Hotel ${u.isoDate}: already filled by the Trinosoft feed — manual reception file NOT overwriting it.`);
+      } else {
+        const next = patchHotelRow(hotelXml, u.isoDate, u.hotelValues);
+        if (next) { hotelXml = next; hotelChanged = true; hotelWritten = true; }
+      }
     }
     if (u.writeExp) {
       const next = patchExpensesRow(expXml, u.isoDate, u.expValues);
       if (next) { expXml = next; expChanged = true; expWritten = true; }
     }
-    return { isoDate: u.isoDate, fnbValues: u.fnbValues, hotelValues: u.hotelValues, expValues: u.expValues, fnbWritten, hotelWritten, expWritten };
+    return { isoDate: u.isoDate, fnbValues: u.fnbValues, hotelValues: u.hotelValues, expValues: u.expValues, fnbWritten, hotelWritten, expWritten, hotelSkipped };
   });
 
   if (!fnbChanged && !hotelChanged && !expChanged) {
@@ -988,7 +1007,15 @@ async function runCheck() {
           try { hv = parseHotelBuffer(hf.buffer, hDate); }
           catch (e) { console.error(`  ERROR [hotel ${hf.filename}]: ${e.message}`); continue; }
           console.log(`  ${hf.filename} → ${hDate}: ${hv.nightsOccupied}/${TOTAL_ROOMS} = ${hv.occupancyPct}%  Rev: ${hv.revenue}`);
-          updates.push({ isoDate: hDate, fnbValues: null, hotelValues: hv, writeFnb: false, writeHotel: true });
+          // Protect only STRICTLY-PAST rows: the Trinosoft feed arrives the morning
+          // after a day closes and finalizes it, so a late manual reception file must
+          // not clobber it. TODAY and FUTURE days have no Trinosoft yet, so re-sent
+          // reception forecasts are allowed to refresh them; the next-morning Trinosoft
+          // feed always overwrites regardless (owner's forward-booking workflow, 2026-08-14).
+          const todayTirane = new Date().toLocaleDateString('en-CA', { timeZone: 'Europe/Tirane' });
+          const isPastDay = hDate < todayTirane;
+          updates.push({ isoDate: hDate, fnbValues: null, hotelValues: hv, writeFnb: false, writeHotel: true,
+                         hotelDeferToExisting: isPastDay });
         }
       }
 
@@ -1018,7 +1045,9 @@ async function runCheck() {
       // Write every row to the Sample Power BI workbook in one download + upload
       console.log('\n Writing to Sample Power BI...');
       const results = await patchXlsx(drive, updates);
-      const written = results.filter(r => r.fnbWritten || r.hotelWritten || r.expWritten);
+      // A hotel row deliberately left to the Trinosoft feed counts as handled — the
+      // email is done, not stuck, so it still gets the processed-report label.
+      const written = results.filter(r => r.fnbWritten || r.hotelWritten || r.expWritten || r.hotelSkipped);
 
       // If NOTHING landed (e.g. the date row wasn't found), do NOT mark the email
       // processed — leave it so a fix + retry can fill it later.
