@@ -138,6 +138,20 @@ function startHealthServer() {
     }
   });
 
+  // ── COMMERCIAL FORECAST ──────────────────────────────────────────────────
+  //    GET /api/forecast — everything the weekly commercial brief needs, as a
+  //    few KB of JSON. The current-year export is ~15 MB, far too large for an
+  //    agent session to fetch and parse, so this service does it: newest
+  //    Prenotimet_<date>.xls from the Drive exports folder, parsed here, with
+  //    the closed 2025 year held in memory as a 112 KB baseline. No new
+  //    dependencies. Safe to fail: wrapped so a problem here cannot stop the
+  //    email pipeline from starting.
+  try {
+    require('./forecast-api').mount(app, authorize);
+  } catch (e) {
+    console.error('[forecast] not mounted:', e && e.message);
+  }
+
   app.listen(PORT, () => {
     console.log(`[server] Health server listening on port ${PORT}`);
   });

@@ -1,0 +1,30 @@
+{
+  "capacity_calendar": [
+    {"from": "2025-01-01", "to": "2026-05-31", "rooms": 110, "note": "Flower + Garden before expansion"},
+    {"from": "2026-06-01", "to": "2027-12-31", "rooms": 160, "note": "+50 Premium Wing rooms (Loft Suite, Classic, Connected). Dashboard AVAIL_2026 uses a gradual June ramp: Jun 4240 nights"}
+  ],
+  "channel_to_segment": {
+    "Whatsapp":"Direct","Social Media":"Direct","Calls":"Direct","Walk In":"Direct","Website/Booking Engine":"Direct","Website":"Direct","Viber":"Direct","EMAIL":"Direct","telefone":"Direct",
+    "Booking.com":"OTA","Booking":"OTA","Expedia":"OTA","Trip.com":"OTA","Very Chic":"OTA",
+    "W2M":"Wholesaler","Hotelbeds":"Wholesaler","Webbeds":"Wholesaler","OTS":"Wholesaler","Agjensi 7BEDS":"Wholesaler",
+    "APOLLO":"Tour Op","Schauinsland":"Tour Op","SAIS TOUR":"Tour Op","DERTOUR":"Tour Op",
+    "ITAKA POLONI":"Itaka","ITAKA HUNGARY":"Itaka","Agjensi":"Agency"
+  },
+  "rules": {
+    "itaka_by_kompania": "Any row whose Kompania contains ITAKA -> channel Itaka, segment Itaka",
+    "agency_2025_uk": "2025 only: Agjensi rows with UK nationality -> Wholesaler (contracted UK business)",
+    "valid": "1 <= nights <= 30; longer blocks are house use / staff / placeholders",
+    "priced": "revenue_pms > 0; Itaka is entered at 0 in Trinisoft",
+    "board_from_kompania": "ALL INCLUSIVE->AI, Half Board->HB, Full Board->FB, Bed & Breakfast->BB, ITAKA->Itaka, else Package/Other (kept as package name)",
+    "wing": "GARDEN*/HOT-TUB -> Garden; Loft Suite / Classic Room (incl CONNECTED) -> Premium Wing (new 2026); else Flower",
+    "pii": "Never carry guest names, emails, phone or card fields into the data layer; keep guest_code and a has_email flag only"
+  },
+  "nationality_map": {"Shqiperi":"Albania","AL":"Albania","XK":"Kosovo","GB":"United Kingdom","FR":"France","DE":"Germany","US":"United States","SE":"Sweden","00":"Unknown","PL":"Poland","Poloni":"Poland","HU":"Hungary","MK":"Macedonia","IT":"Italy","NL":"Netherlands","CH":"Switzerland","DK":"Denmark"},
+  "itaka_contract_2026": {
+    "rate_per_room_night_main": 145, "rate_per_room_night_shoulder": 128,
+    "PL": {"period": "2026-05-24/2026-09-26", "main": "2026-05-31/2026-09-22", "rooms": 30, "guarantee_eur": 500250},
+    "HU": {"period": "2026-06-01/2026-09-27", "main": "2026-06-08/2026-09-27", "rooms": 10, "guarantee_eur": 162400},
+    "note": "Per person per night AI Premium: 72.50 main / 64 shoulder; guarantee = rooms x main days x 2 pax; EB 15% on 40% of turnover; 0.5% marketing"
+  },
+  "source": "Trinisoft 'Prenotimet ne recepsion' SpreadsheetML export; baseline built 2026-09-05"
+}
