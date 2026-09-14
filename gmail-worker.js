@@ -64,9 +64,13 @@ function isHouseUse(tableStr) {
 }
 
 // ── STATUS TRACKING (for /health endpoint) ────────────────────────────────────
-// Bump BUILD on each deploy that matters so `GET /` can confirm what's actually live
-// (Render's autodeploy has been known to lag/stick behind origin/master here).
-const BUILD          = 'hotel-xlsx-endpoint-2026-08-01';
+// `GET /` reports what is ACTUALLY live — Render's autodeploy has been known to
+// lag/stick behind origin/master. The commit comes from Render itself, so it is
+// right without anyone remembering to bump it; LABEL is just a human name for the
+// deploy and commit is the source of truth.
+const BUILD_LABEL    = 'exp-total-number-format-2026-09-14';
+const BUILD_COMMIT   = (process.env.RENDER_GIT_COMMIT || '').slice(0, 7) || 'local';
+const BUILD          = `${BUILD_LABEL} (${BUILD_COMMIT})`;
 let lastCheckTime    = null;
 let lastCheckStatus  = 'not started';
 let lastProcessed    = null;
@@ -83,6 +87,7 @@ function startHealthServer() {
       service:       'Flower Hotel Gmail Report Processor',
       status:        'running',
       build:         BUILD,
+      commit:        BUILD_COMMIT,
       checkInterval: `${CHECK_INTERVAL_MS / 60000} minutes`,
       lastCheck:     lastCheckTime,
       lastStatus:    lastCheckStatus,
