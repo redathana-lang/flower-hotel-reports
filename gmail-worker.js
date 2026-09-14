@@ -669,6 +669,45 @@ function readCellVal(rowXml, col, r) {
   return m ? parseFloat(m[1]) : 0;
 }
 
+// Style (cellXfs) indices whose number format is a PERCENT format. A money total
+// written with one of these renders as 47043891.00% instead of 470,438.91, so the
+// TOTAL column must never carry or inherit one. Rebuilt from styles.xml each run.
+let PCT_STYLES = new Set();
+async function loadPercentStyles(zip) {
+  PCT_STYLES = new Set();
+  const f = zip.file('xl/styles.xml');
+  if (!f) return;
+  const xml = await f.async('string');
+  const custom = new Set();
+  const nf = xml.match(/<numFmts[\s\S]*?<\/numFmts>/);
+  if (nf) for (const m of nf[0].matchAll(/numFmtId="(\d+)"[^>]*formatCode="([^"]*)"/g)) {
+    if (m[2].includes('%')) custom.add(m[1]);
+  }
+  const cellXfs = xml.match(/<cellXfs[\s\S]*?<\/cellXfs>/);
+  if (!cellXfs) return;
+  let i = 0;
+  for (const m of cellXfs[0].matchAll(/<xf\b[^>]*?(?:\/>|>[\s\S]*?<\/xf>)/g)) {
+    const id = (m[0].match(/numFmtId="(\d+)"/) || [])[1];
+    if (id === '9' || id === '10' || custom.has(id)) PCT_STYLES.add(String(i));
+    i++;
+  }
+  console.log(`  percent styles (never used for a total): ${[...PCT_STYLES].join(',') || 'none'}`);
+}
+
+// Style index for a TOTAL (col R) cell, borrowed from the nearest row that already
+// carries a total — above first, then below. Percent styles are skipped, otherwise
+// one bad row teaches the next. Never hardcode an index: Google Sheets renumbers
+// every style in the workbook each time it re-saves the file.
+function totalStyleNear(expXml, r) {
+  const styleAt = k => {
+    const m = expXml.match(new RegExp(`<c r="R${k}" s="(\\d+)"[^>]*>(?:<f[^>]*(?:\\/>|>[\\s\\S]*?<\\/f>))?<v>`));
+    return (m && !PCT_STYLES.has(m[1])) ? m[1] : null;
+  };
+  for (let k = r - 1; k >= 2 && k >= r - 400; k--) { const s = styleAt(k); if (s) return s; }
+  for (let k = r + 1; k <= r + 400; k++)           { const s = styleAt(k); if (s) return s; }
+  return '0'; // General — plain, but never a percentage
+}
+
 // Patch one DAILY EXPENSES (sheet5) date row — SELECTIVE per-column update: only the
 // magazine columns from the report are touched, every other cell (Beach Bar, SPA,
 // Paga & Utilitete, manual entries…) is preserved. TOTAL (col R) is recomputed but
@@ -693,9 +732,19 @@ function patchExpensesRow(expXml, isoDate, expValues) {
   let total = 0;
   'BCDEFGHIJKLMNOPQ'.split('').forEach(c => { total += (expValues[c] != null ? expValues[c] : readCellVal(newRow, c, r)); });
   total = Math.round(total * 100) / 100;
-  const rM = newRow.match(new RegExp(`<c r="R${r}"([^>]*?)>([\\s\\S]*?)<\\/c>`));
-  const rStyle = (rM && rM[1].match(/\bs="(\d+)"/)) ? rM[1].match(/\bs="(\d+)"/)[1] : '27';
-  const fM = rM ? rM[2].match(/<f[^>]*\/>|<f[^>]*>[\s\S]*?<\/f>/) : null;
+  // A day nobody has filled yet carries an EMPTY self-closing TOTAL cell
+  // (<c r="R166" s="18"/>), so the match has to allow that shape — and its blank
+  // style must not be reused for a money value. Take the style from the closest
+  // row above that already holds a total instead. (Getting this wrong is what
+  // printed totals as percentages: the old fallback style was numFmt 10 = 0.00%,
+  // so 470,438.91 rendered as 47043891.00%.)
+  const rM = newRow.match(new RegExp(`<c r="R${r}"([^>]*?)(?:\\/>|>([\\s\\S]*?)<\\/c>)`));
+  const ownStyleM = rM ? rM[1].match(/\bs="(\d+)"/) : null;
+  const hadTotal  = !!(rM && rM[2] && /<v>/.test(rM[2]));
+  const rStyle = (hadTotal && ownStyleM && !PCT_STYLES.has(ownStyleM[1]))
+    ? ownStyleM[1]
+    : totalStyleNear(expXml, r);
+  const fM = (rM && rM[2]) ? rM[2].match(/<f[^>]*\/>|<f[^>]*>[\s\S]*?<\/f>/) : null;
   const rCell = `<c r="R${r}" s="${rStyle}">${fM ? fM[0] : '<f t="shared" si="1"/>'}<v>${total}</v></c>`;
   newRow = newRow.replace(new RegExp(`<c r="R${r}"(?:[^>]*\\/>|[^>]*>[\\s\\S]*?<\\/c>)`), rCell);
 
@@ -748,6 +797,7 @@ async function patchXlsx(drive, updates) {
   console.log(`  ${(buffer.length / 1024).toFixed(0)} KB`);
 
   const zip = await JSZip.loadAsync(buffer);
+  await loadPercentStyles(zip);
   // Resolve each sheet by name (re-save-proof), not by a hardcoded sheetN.xml.
   const fnbPath   = await resolveSheetPath(zip, 'DAILY F&B REVENUES');
   const hotelPath = await resolveSheetPath(zip, 'HOTEL DAILY PERFORMANCE');
